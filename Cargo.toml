@@ -1,0 +1,19 @@
+[package]
+name = "wechat_viewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.8"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+eframe = "0.37.0"
+egui_extras = { version = "0.37", features = ["datepicker"] }
+hmac = "0.12"
+image = "0.25.10"
+jiff = "0.2"
+libloading = "0.9.1"
+md-5 = "0.11.0"
+memchr = "2.8.3"
+ruzstd = "0.9.1"
+sha2 = "0.10"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_Security_Cryptography", "Win32_Networking_WinHttp", "Win32_System_Environment", "Win32_System_Diagnostics_Debug", "Win32_System_Console"] }
