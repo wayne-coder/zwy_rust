@@ -1,0 +1,422 @@
+//! 赔率与回水设置：默认一套，分组一套，会员可单独覆盖。
+//!
+//! 结算优先级：会员个性化 > 所属分组 > 默认。每个层级都有澳门 / 香港 /
+//! 老澳门三份，玩法字段与参考项目 `zwy_wails_v1` 的 `OddsSettings` 对齐
+//! （本程序未实现的「带砍」等玩法不在此列）。
+//!
+//! 存储位置：`%LOCALAPPDATA%\WechatViewer\odds.txt`，一行一个「对象 + 地区」：
+//!
+//! ```text
+//! wxv-odds	1
+//! default	澳门	0	two_in_two=66	...
+//! group	A 组	0	two_in_two=70	...
+//! member	张三	0	two_in_two=68	...
+//! ```
+//!
+//! 读取时缺字段一律回落到默认值，未知字段与损坏行忽略。
+
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+const MAGIC: &str = "wxv-odds\t1";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Odds,
+    Rebate,
+}
+
+pub struct FieldDef {
+    pub key: &'static str,
+    pub label: &'static str,
+    /// 设置页里的玩法分组
+    pub group: &'static str,
+    pub kind: FieldKind,
+    pub default: f64,
+}
+
+const fn odd(key: &'static str, label: &'static str, group: &'static str, default: f64) -> FieldDef {
+    FieldDef {
+        key,
+        label,
+        group,
+        kind: FieldKind::Odds,
+        default,
+    }
+}
+
+const fn rw(key: &'static str, label: &'static str, group: &'static str, default: f64) -> FieldDef {
+    FieldDef {
+        key,
+        label,
+        group,
+        kind: FieldKind::Rebate,
+        default,
+    }
+}
+
+/// 设置页按这个顺序分组展示。
+pub const FIELD_GROUPS: &[&str] = &[
+    "组合",
+    "特码",
+    "平码",
+    "平特",
+    "连肖",
+    "连尾",
+    "不中",
+    "中一",
+    "六肖中一",
+];
+
+pub const FIELDS: &[FieldDef] = &[
+    // ── 组合 ──
+    odd("two_in_two", "二中二赔率", "组合", 66.0),
+    odd("two_in_two_dai_kan", "二中二带砍赔率", "组合", 0.0),
+    odd("two_all_hit", "二全中赔率", "组合", 66.0),
+    odd("three_in_three", "三中三赔率", "组合", 750.0),
+    odd("three_in_two_liang", "三中二·中2赔率", "组合", 20.0),
+    odd("three_in_two_sa", "三中二·中3赔率", "组合", 100.0),
+    odd("special_hit", "特碰赔率", "组合", 160.0),
+    rw("rw_two_in_two", "二中二回水(%)", "组合", 15.0),
+    rw("rw_two_all_hit", "二全中回水(%)", "组合", 15.0),
+    rw("rw_three_in_three", "三中三回水(%)", "组合", 15.0),
+    rw("rw_three_in_two", "三中二回水(%)", "组合", 15.0),
+    rw("rw_special_hit", "特碰回水(%)", "组合", 15.0),
+    // ── 特码 ──
+    odd("special_number", "特码赔率", "特码", 47.0),
+    odd("special_attr", "特码属性赔率", "特码", 1.9),
+    odd("special_attr_49", "特码开49赔率", "特码", 1.0),
+    rw("rw_special_number", "特码回水(%)", "特码", 4.0),
+    // ── 平码 ──
+    odd("flat_number", "平码赔率", "平码", 8.0),
+    rw("rw_flat_number", "平码回水(%)", "平码", 0.0),
+    // ── 平特 ──
+    odd("flat_special_4", "平特4码赔率", "平特", 2.0),
+    rw("rw_flat_special_4", "平特4码回水(%)", "平特", 4.0),
+    odd("flat_special_5", "平特5码赔率", "平特", 1.8),
+    rw("rw_flat_special_5", "平特5码回水(%)", "平特", 0.0),
+    // ── 连肖 ──
+    odd("lianxiao_2", "二连肖赔率", "连肖", 4.5),
+    odd("lianxiao_3", "三连肖赔率", "连肖", 11.0),
+    odd("lianxiao_4", "四连肖赔率", "连肖", 33.0),
+    odd("lianxiao_5", "五连肖赔率", "连肖", 110.0),
+    odd("lianxiao_ma_2", "二连肖含马赔率", "连肖", 4.0),
+    odd("lianxiao_ma_3", "三连肖含马赔率", "连肖", 10.0),
+    odd("lianxiao_ma_4", "四连肖含马赔率", "连肖", 30.0),
+    odd("lianxiao_ma_5", "五连肖含马赔率", "连肖", 90.0),
+    rw("rw_lianxiao", "连肖回水(%)", "连肖", 4.0),
+    // ── 连尾 ──
+    odd("lianwei_2", "二连尾赔率", "连尾", 2.0),
+    odd("lianwei_3", "三连尾赔率", "连尾", 6.0),
+    odd("lianwei_4", "四连尾赔率", "连尾", 11.0),
+    odd("lianwei_zero_2", "二连尾含0尾赔率", "连尾", 3.0),
+    odd("lianwei_zero_3", "三连尾含0尾赔率", "连尾", 8.0),
+    odd("lianwei_zero_4", "四连尾含0尾赔率", "连尾", 15.0),
+    rw("rw_lianwei", "连尾回水(%)", "连尾", 4.0),
+    // ── 不中 ──
+    odd("buzhong_5", "五不中赔率", "不中", 2.0),
+    odd("buzhong_6", "六不中赔率", "不中", 2.0),
+    odd("buzhong_7", "七不中赔率", "不中", 2.1),
+    odd("buzhong_8", "八不中赔率", "不中", 3.0),
+    odd("buzhong_9", "九不中赔率", "不中", 4.0),
+    odd("buzhong_10", "十不中赔率", "不中", 5.0),
+    rw("rw_buzhong", "不中回水(%)", "不中", 2.0),
+    // ── 中一 ──
+    odd("zhongyi_3", "三中一赔率", "中一", 2.6),
+    rw("rw_zhongyi", "三中一回水(%)", "中一", 4.0),
+    odd("zhongyi_4", "四中一赔率", "中一", 2.0),
+    rw("rw_zhongyi_4", "四中一回水(%)", "中一", 4.0),
+    odd("zhongyi_5", "五中一赔率", "中一", 1.8),
+    rw("rw_zhongyi_5", "五中一回水(%)", "中一", 0.0),
+    // ── 六肖中一 ──
+    odd("liuxiao_zhongyi", "六肖中一赔率", "六肖中一", 1.9),
+    odd("liuxiao_zhongyi_49", "六肖中一开49赔率", "六肖中一", 1.0),
+    rw("rw_liuxiao", "六肖中一回水(%)", "六肖中一", 4.0),
+];
+
+#[derive(Clone, Debug)]
+pub struct OddsSet {
+    values: Vec<f64>,
+}
+
+impl Default for OddsSet {
+    fn default() -> Self {
+        Self {
+            values: FIELDS.iter().map(|f| f.default).collect(),
+        }
+    }
+}
+
+fn field_index(key: &str) -> Option<usize> {
+    FIELDS.iter().position(|f| f.key == key)
+}
+
+fn round2(v: f64) -> f64 {
+    if v.is_finite() {
+        (v * 100.0).round() / 100.0
+    } else {
+        0.0
+    }
+}
+
+impl OddsSet {
+    pub fn value(&self, key: &str) -> f64 {
+        field_index(key)
+            .and_then(|i| self.values.get(i).copied())
+            .unwrap_or(0.0)
+    }
+
+    pub fn value_mut(&mut self, key: &str) -> Option<&mut f64> {
+        let i = field_index(key)?;
+        self.values.get_mut(i)
+    }
+
+    /// 整份恢复默认值（当前地区）。
+    pub fn reset_to_default(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn default_regions() -> [OddsSet; 3] {
+    [
+        OddsSet::default(),
+        OddsSet::default(),
+        OddsSet::default(),
+    ]
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OddsConfig {
+    pub default: [OddsSet; 3],
+    pub groups: BTreeMap<String, [OddsSet; 3]>,
+    pub members: BTreeMap<String, [OddsSet; 3]>,
+}
+
+impl OddsConfig {
+    pub fn has_group(&self, name: &str) -> bool {
+        self.groups.contains_key(name)
+    }
+
+    /// 分组第一次被设置时复制默认赔率（和参考项目「新增投注人复制默认」一致）。
+    pub fn ensure_group(&mut self, name: &str) {
+        self.groups
+            .entry(name.to_string())
+            .or_insert_with(default_regions);
+    }
+
+    /// 新增会员覆盖时复制该会员当前生效的那份（分组或默认）。
+    pub fn ensure_member(&mut self, name: &str, group: Option<&str>) {
+        if self.members.contains_key(name) {
+            return;
+        }
+        let base = [
+            self.resolve(name, group, 0).clone(),
+            self.resolve(name, group, 1).clone(),
+            self.resolve(name, group, 2).clone(),
+        ];
+        self.members.insert(name.to_string(), base);
+    }
+
+    /// 结算时取赔率：会员覆盖 → 分组 → 默认。
+    pub fn resolve(&self, member: &str, group: Option<&str>, region: usize) -> &OddsSet {
+        let region = region.min(2);
+        if let Some(p) = self.members.get(member) {
+            return &p[region];
+        }
+        if let Some(g) = group {
+            if let Some(p) = self.groups.get(g) {
+                return &p[region];
+            }
+        }
+        &self.default[region]
+    }
+
+    pub fn resolve_lottery(&self, member: &str, group: Option<&str>, lottery: &str) -> &OddsSet {
+        self.resolve(member, group, region_index(lottery))
+    }
+}
+
+/// 地区下标：0 澳门、1 香港、2 老澳门。
+pub fn region_index(lottery: &str) -> usize {
+    match lottery {
+        "香港" => 1,
+        "老澳门" => 2,
+        _ => 0,
+    }
+}
+
+pub const REGION_LABELS: [&str; 3] = ["澳门", "香港", "老澳门"];
+
+fn store_path() -> PathBuf {
+    let base = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    base.join("WechatViewer").join("odds.txt")
+}
+
+fn clean_name(name: &str) -> String {
+    name.replace(['\t', '\n', '\r'], " ").trim().to_string()
+}
+
+pub fn load() -> OddsConfig {
+    let Ok(text) = fs::read_to_string(store_path()) else {
+        return OddsConfig::default();
+    };
+    parse(&text)
+}
+
+pub fn save(config: &OddsConfig) {
+    let path = store_path();
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("txt.tmp");
+    if fs::write(&tmp, serialize(config)).is_err() {
+        return;
+    }
+    let _ = fs::rename(&tmp, &path);
+}
+
+fn write_set(out: &mut String, kind: &str, name: &str, region: usize, set: &OddsSet) {
+    out.push_str(kind);
+    out.push('\t');
+    out.push_str(name);
+    out.push('\t');
+    out.push_str(&region.to_string());
+    for (i, f) in FIELDS.iter().enumerate() {
+        out.push('\t');
+        out.push_str(f.key);
+        out.push('=');
+        let v = set.values.get(i).copied().unwrap_or(f.default);
+        out.push_str(&format!("{v}"));
+    }
+    out.push('\n');
+}
+
+pub fn serialize(config: &OddsConfig) -> String {
+    let mut out = String::from(MAGIC);
+    out.push('\n');
+    for (region, set) in config.default.iter().enumerate() {
+        write_set(&mut out, "default", "默认", region, set);
+    }
+    for (name, sets) in &config.groups {
+        let name = clean_name(name);
+        if name.is_empty() {
+            continue;
+        }
+        for (region, set) in sets.iter().enumerate() {
+            write_set(&mut out, "group", &name, region, set);
+        }
+    }
+    for (name, sets) in &config.members {
+        let name = clean_name(name);
+        if name.is_empty() {
+            continue;
+        }
+        for (region, set) in sets.iter().enumerate() {
+            write_set(&mut out, "member", &name, region, set);
+        }
+    }
+    out
+}
+
+pub fn parse(text: &str) -> OddsConfig {
+    let mut config = OddsConfig::default();
+    if !text.starts_with(MAGIC) {
+        return config;
+    }
+    for line in text.lines().skip(1) {
+        let mut parts = line.split('\t');
+        let Some(kind) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let Some(region) = parts.next().and_then(|r| r.parse::<usize>().ok()) else {
+            continue;
+        };
+        if region > 2 {
+            continue;
+        }
+        let target: &mut [OddsSet; 3] = match kind {
+            "default" => &mut config.default,
+            "group" => {
+                let name = clean_name(name);
+                if name.is_empty() {
+                    continue;
+                }
+                config.groups.entry(name).or_insert_with(default_regions)
+            }
+            "member" => {
+                let name = clean_name(name);
+                if name.is_empty() {
+                    continue;
+                }
+                config.members.entry(name).or_insert_with(default_regions)
+            }
+            _ => continue,
+        };
+        let set = &mut target[region];
+        for pair in parts {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let Ok(v) = value.trim().parse::<f64>() else {
+                continue;
+            };
+            if let Some(slot) = set.value_mut(key.trim()) {
+                *slot = round2(v).max(0.0);
+            }
+        }
+    }
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_keeps_group_and_member_overrides() {
+        let mut cfg = OddsConfig::default();
+        cfg.ensure_group("A 组");
+        for region in 0..3 {
+            if let Some(v) = cfg.groups.get_mut("A 组").unwrap()[region]
+                .value_mut("two_in_two")
+            {
+                *v = 70.0;
+            }
+        }
+        cfg.ensure_member("张三", Some("A 组"));
+        cfg.members.get_mut("张三").unwrap()[1]
+            .value_mut("rw_two_in_two")
+            .map(|v| *v = 12.5);
+
+        let text = serialize(&cfg);
+        let back = parse(&text);
+        assert_eq!(back.resolve("张三", Some("A 组"), 0).value("two_in_two"), 70.0);
+        assert_eq!(back.resolve("张三", Some("A 组"), 1).value("rw_two_in_two"), 12.5);
+        // 会员第二地区只在回水上覆盖，赔率仍复制自分组那份
+        assert_eq!(back.resolve("张三", Some("A 组"), 1).value("two_in_two"), 70.0);
+        assert_eq!(back.resolve("李四", Some("A 组"), 0).value("two_in_two"), 70.0);
+        assert_eq!(back.resolve("王五", None, 0).value("two_in_two"), 66.0);
+    }
+
+    #[test]
+    fn defaults_match_settle_values() {
+        let d = OddsSet::default();
+        assert_eq!(d.value("two_in_two"), 66.0);
+        assert_eq!(d.value("three_in_three"), 750.0);
+        assert_eq!(d.value("three_in_two_liang"), 20.0);
+        assert_eq!(d.value("three_in_two_sa"), 100.0);
+        assert_eq!(d.value("lianxiao_ma_2"), 4.0);
+        assert_eq!(d.value("rw_three_in_two"), 15.0);
+    }
+
+    #[test]
+    fn missing_fields_fall_back_to_default() {
+        let cfg = parse("wxv-odds\t1\ngroup\tA\t0\ttwo_in_two=70\n");
+        assert_eq!(cfg.resolve("", Some("A"), 0).value("two_in_two"), 70.0);
+        assert_eq!(cfg.resolve("", Some("A"), 0).value("flat_number"), 8.0);
+        assert_eq!(cfg.resolve("", Some("A"), 1).value("two_in_two"), 66.0);
+    }
+}

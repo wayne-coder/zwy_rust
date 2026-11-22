@@ -4552,6 +4552,7 @@ dependencies = [
 name = "wechat_viewer"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "aes",
  "chrono",
  "eframe",

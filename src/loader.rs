@@ -358,7 +358,7 @@ fn load(ctx: &egui::Context, tx: &Sender<Msg>) -> Result<AppData, String> {
         ));
     }
 
-    rep.status("正在从微信进程读取数据库密钥…");
+    rep.status("正在加载中…");
     let t_scan = Instant::now();
     let (live, logs) = keyextract::extract_all();
     let cached = cache::load();
@@ -731,7 +731,6 @@ fn load(ctx: &egui::Context, tx: &Sender<Msg>) -> Result<AppData, String> {
     Ok(AppData {
         self_wxid: wxid,
         self_name,
-        account_dir: account_name,
         account_path: account.clone(),
         workdir: workdir.clone(),
         keys,

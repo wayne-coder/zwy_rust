@@ -16,7 +16,7 @@ use chrono::{Local, TimeZone, Timelike};
 use md5::{Digest, Md5};
 
 use crate::decrypt::{self, KeySpec};
-use crate::model::{ImportResult, MsgRow};
+use crate::model::{ImportResult, MsgRow, QuoteRef};
 use crate::sqlite::Conn;
 
 /// 导入与实时监控会同时对消息库做解密/查询；串行化避免临时文件互相覆盖。
@@ -156,7 +156,8 @@ fn collect(
     }
 
     let mut rows: Vec<MsgRow> = Vec::new();
-    let mut seen: HashSet<(i64, String, String)> = HashSet::new();
+    // 会话也参与去重：同一成员在不同群聊里的消息必须各自保留。
+    let mut seen: HashSet<(i64, String, String, String)> = HashSet::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut max_sort = since_sort.unwrap_or(req.start_ts.saturating_mul(1000));
 
@@ -224,7 +225,8 @@ fn collect(
                 let ts = r.int(2);
                 let content_bytes = r.bytes(3);
                 let compress = r.bytes(4);
-                let (kind, content) = decode_message(mtype, &content_bytes, &compress);
+                let (kind, content, link_url, quote) =
+                    decode_message(mtype, &content_bytes, &compress);
                 let sort_seq = r.int(5);
                 let sort = if sort_seq > 0 {
                     sort_seq
@@ -232,7 +234,7 @@ fn collect(
                     ts.saturating_mul(1000)
                 };
 
-                if !seen.insert((sort, sender.clone(), content.clone())) {
+                if !seen.insert((sort, chat.clone(), sender.clone(), content.clone())) {
                     continue;
                 }
                 max_sort = max_sort.max(sort);
@@ -249,11 +251,13 @@ fn collect(
                 rows.push(MsgRow {
                     kind,
                     nick,
-                    content: truncate_chars(&content, 10),
+                    content,
                     time: format_time(ts),
                     sort,
                     chat: chat.clone(),
                     sender: sender.clone(),
+                    link_url,
+                    quote,
                 });
             }
         }
@@ -415,8 +419,12 @@ fn format_time(ts: i64) -> String {
 
 // ---------------- 正文解码 ----------------
 
-fn decode_message(mtype: i64, content: &[u8], compress: &[u8]) -> (String, String) {
-    let (kind, fallback) = kind_of(mtype);
+fn decode_message(
+    mtype: i64,
+    content: &[u8],
+    compress: &[u8],
+) -> (String, String, Option<String>, Option<QuoteRef>) {
+    let (mut kind, fallback) = kind_of(mtype);
     let mut text = match kind.as_str() {
         "文字" | "系统" | "链接" | "其他" | "红包" => {
             let mut t = decode_text(content);
@@ -427,9 +435,25 @@ fn decode_message(mtype: i64, content: &[u8], compress: &[u8]) -> (String, Strin
         }
         _ => String::new(),
     };
+    let mut link_url = None;
+    let mut quote = None;
 
     if kind == "链接" && !text.is_empty() {
-        if let Some(title) = extract_title(&text) {
+        // 链接与「引用」都走 appmsg（type 49）。引用消息的 <type>57</type>
+        // 和被引用的原文都在 <refermsg> 里；普通链接才取 <url>。
+        let unescaped = text.replace("&lt;", "<").replace("&gt;", ">");
+        let xml = if text.contains("<refermsg") {
+            text.as_str()
+        } else {
+            unescaped.as_str()
+        };
+        if extract_tag(xml, "type").as_deref() == Some("57") || xml.contains("<refermsg") {
+            kind = "引用".to_string();
+            quote = parse_quote(xml);
+        } else {
+            link_url = extract_tag(xml, "url").or_else(|| extract_tag(xml, "link"));
+        }
+        if let Some(title) = extract_title(xml) {
             text = title;
         }
     }
@@ -438,9 +462,43 @@ fn decode_message(mtype: i64, content: &[u8], compress: &[u8]) -> (String, Strin
         text = strip_sender_prefix(&text);
     }
     if text.trim().is_empty() {
-        text = fallback.to_string();
+        if kind == "引用" {
+            text = "[引用]".to_string();
+        } else {
+            text = fallback.to_string();
+        }
     }
-    (kind, text)
+    (kind, text, link_url, quote)
+}
+
+/// 解析「引用」消息里的 `<refermsg>`：被引用正文、发送人、时间。
+fn parse_quote(xml: &str) -> Option<QuoteRef> {
+    let open = xml.find("<refermsg")?;
+    let start = open + xml[open..].find('>')? + 1;
+    let end = xml[start..].find("</refermsg>")? + start;
+    let body = &xml[start..end];
+    let mut content = extract_tag(body, "content").unwrap_or_default();
+    // 被引用的是链接 / 文件时 content 又是一段 XML，取它的标题即可。
+    if content.trim_start().starts_with('<') {
+        if let Some(title) = extract_title(&content) {
+            content = title;
+        }
+    }
+    let from = extract_tag(body, "displayname").unwrap_or_default();
+    let from_usr = extract_tag(body, "fromusr").unwrap_or_default();
+    let create_time = extract_tag(body, "createtime")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    if content.trim().is_empty() && from.is_empty() {
+        None
+    } else {
+        Some(QuoteRef {
+            content: content.trim().to_string(),
+            from,
+            from_usr,
+            create_time,
+        })
+    }
 }
 
 /// 群消息正文常带 `wxid_xxx:\n` 前缀（发送者账号），去掉它只留真正的内容。
@@ -486,25 +544,6 @@ fn kind_of(mtype: i64) -> (String, &'static str) {
 
 fn is_known_type(t: i64) -> bool {
     matches!(t, 1 | 3 | 34 | 43 | 47 | 48 | 49 | 50 | 10000 | 11000)
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| {
-            if c == '\n' || c == '\r' || c == '\t' {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let mut it = cleaned.chars();
-    let mut out: String = it.by_ref().take(max).collect();
-    if it.next().is_some() {
-        out.push('…');
-    }
-    out.trim().to_string()
 }
 
 fn clean_text(s: &str) -> String {
@@ -592,12 +631,72 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn extract_title(xml: &str) -> Option<String> {
-    let start = xml.find("<title>")? + "<title>".len();
-    let end = xml[start..].find("</title>")? + start;
+    extract_tag(xml, "title")
+}
+
+fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
     let t = xml[start..end].trim();
+    // 微信 XML 常把标题 / 链接包在 CDATA 里。
+    let t = t
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .unwrap_or(t)
+        .trim();
     if t.is_empty() {
         None
     } else {
-        Some(t.to_string())
+        Some(t.replace("&amp;", "&").replace("&#38;", "&"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_message, extract_tag, extract_title, parse_quote};
+
+    #[test]
+    fn extracts_cdata_title_and_url() {
+        let xml = "<msg><appmsg><title><![CDATA[H5 链接]]></title>\
+                   <url><![CDATA[https://example.com/a?x=1&amp;y=2]]></url>\
+                   </appmsg></msg>";
+        assert_eq!(extract_title(xml).as_deref(), Some("H5 链接"));
+        assert_eq!(
+            extract_tag(xml, "url").as_deref(),
+            Some("https://example.com/a?x=1&y=2")
+        );
+    }
+
+    #[test]
+    fn quote_message_is_parsed_and_classified() {
+        let xml = "<msg><appmsg><title>收到，跟一手</title><type>57</type>                   <refermsg><type>1</type><fromusr>wxid_a</fromusr>                   <displayname>张三</displayname><content>三中三 01,02,03 各10</content>                   <createtime>1700000000</createtime></refermsg></appmsg></msg>";
+        let (kind, text, url, quote) = decode_message(49, xml.as_bytes(), &[]);
+        assert_eq!(kind, "引用");
+        assert_eq!(text, "收到，跟一手");
+        assert!(url.is_none());
+        let quote = quote.expect("quote");
+        assert_eq!(quote.content, "三中三 01,02,03 各10");
+        assert_eq!(quote.from, "张三");
+        assert_eq!(quote.from_usr, "wxid_a");
+        assert_eq!(quote.create_time, 1_700_000_000);
+        assert!(parse_quote("<msg></msg>").is_none());
+    }
+
+    #[test]
+    fn normal_link_message_keeps_url() {
+        let xml = "<msg><appmsg><title>下注说明</title><type>5</type>                   <url>https://example.com/bet</url></appmsg></msg>";
+        let (kind, text, url, quote) = decode_message(49, xml.as_bytes(), &[]);
+        assert_eq!(kind, "链接");
+        assert_eq!(text, "下注说明");
+        assert_eq!(url.as_deref(), Some("https://example.com/bet"));
+        assert!(quote.is_none());
+    }
+
+    #[test]
+    fn missing_tags_are_none() {
+        assert!(extract_title("<msg></msg>").is_none());
+        assert!(extract_tag("<msg></msg>", "url").is_none());
     }
 }
