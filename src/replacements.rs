@@ -18,6 +18,9 @@ pub type Rule = (String, String);
 
 const MAGIC: &str = "wxv-replace\t1";
 
+/// 内置默认替换词（当前这台机器上配置好的版本），换电脑时直接使用。
+const DEFAULT_REPLACEMENTS: &str = include_str!("defaults/replacements.txt");
+
 fn store_path() -> PathBuf {
     let base = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -27,9 +30,17 @@ fn store_path() -> PathBuf {
 
 pub fn load() -> Vec<Rule> {
     let Ok(text) = fs::read_to_string(store_path()) else {
-        return Vec::new();
+        return default_rules();
     };
+    if !text.starts_with(MAGIC) {
+        return default_rules();
+    }
     parse(&text)
+}
+
+/// 编译进 exe 的默认替换词。
+pub fn default_rules() -> Vec<Rule> {
+    parse(DEFAULT_REPLACEMENTS)
 }
 
 pub fn save(rules: &[Rule]) {
@@ -158,5 +169,13 @@ mod tests {
     #[test]
     fn parse_requires_magic() {
         assert!(parse("rule\tA\tB\n").is_empty());
+    }
+
+    #[test]
+    fn default_rules_are_embedded() {
+        let rules = default_rules();
+        assert!(rules.contains(&("X".to_string(), "拖".to_string())));
+        assert!(rules.contains(&("复试".to_string(), "复式".to_string())));
+        assert!(rules.contains(&("三三".to_string(), "三中三".to_string())));
     }
 }

@@ -128,7 +128,7 @@ pub fn zodiac_of(n: u32) -> Option<&'static str> {
         .map(|(z, _)| *z)
 }
 
-fn tail_of(n: u32) -> u32 {
+pub(crate) fn tail_of(n: u32) -> u32 {
     n % 10
 }
 
@@ -197,7 +197,7 @@ fn static_attr(kw: &str) -> Option<&'static [u32]> {
     })
 }
 
-fn attr_numbers(kw: &str) -> Option<Vec<u32>> {
+pub(crate) fn attr_numbers(kw: &str) -> Option<Vec<u32>> {
     match kw {
         "大" => return Some((25..=49).collect()),
         "小" => return Some((1..=24).collect()),
@@ -425,12 +425,27 @@ fn flat_special_groups(content: &str) -> Vec<Vec<u32>> {
     groups
 }
 
-fn pick_tokens(content: &str) -> Vec<&str> {
+pub(crate) fn pick_tokens(content: &str) -> Vec<&str> {
     content
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// 十二生肖的固定顺序（与号码表一致），平特面板的 22 个固定格按它排。
+pub fn zodiac_names() -> Vec<&'static str> {
+    ZODIACS.iter().map(|(z, _)| *z).collect()
+}
+
+/// 号码的波色名（'红波' / '蓝波' / '绿波'），查不到返回 None。
+pub fn wave_of(n: u32) -> Option<&'static str> {
+    for (name, kw) in [("红波", "红波"), ("蓝波", "蓝波"), ("绿波", "绿波")] {
+        if static_attr(kw).is_some_and(|nums| nums.contains(&n)) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn lian_zodiacs(content: &str) -> BTreeSet<String> {

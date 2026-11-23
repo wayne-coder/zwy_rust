@@ -217,16 +217,18 @@ fn collect(
                 let mtype = r.int(0);
                 let sender_id = r.int(1);
                 let sender = name2id.get(&sender_id).cloned().unwrap_or_default();
-                if let Some(f) = filter {
-                    if !f.contains(&sender) {
-                        continue;
-                    }
-                }
                 let ts = r.int(2);
                 let content_bytes = r.bytes(3);
                 let compress = r.bytes(4);
                 let (kind, content, link_url, quote) =
                     decode_message(mtype, &content_bytes, &compress);
+                // 撤回提示是系统消息（发送人为空），不属于任何分组成员，
+                // 但它是退款 / 改单的关键线索，必须进引用列表。
+                if let Some(f) = filter {
+                    if kind != "撤回" && !f.contains(&sender) {
+                        continue;
+                    }
+                }
                 let sort_seq = r.int(5);
                 let sort = if sort_seq > 0 {
                     sort_seq
@@ -320,6 +322,19 @@ pub fn start_monitor(
                 Ok(c) => {
                     last_sort = last_sort.max(c.max_sort);
                     if !c.rows.is_empty() {
+                        // 新引用要立刻弹引用列表：先确保主窗口没被最小化。
+                        // 主窗口不可见时 eframe 可能不再跑 UI，光 request_repaint
+                        // 不一定能把引用窗口弹出来，所以这里直接把主窗口恢复。
+                        if c.rows.iter().any(|r| r.kind == "引用") {
+                            ctx.send_viewport_cmd_to(
+                                eframe::egui::ViewportId::ROOT,
+                                eframe::egui::ViewportCommand::Minimized(false),
+                            );
+                            ctx.send_viewport_cmd_to(
+                                eframe::egui::ViewportId::ROOT,
+                                eframe::egui::ViewportCommand::Visible(true),
+                            );
+                        }
                         let _ = tx.send(MonitorMsg::Rows(c.rows));
                         ctx.request_repaint();
                     }
@@ -433,6 +448,14 @@ fn decode_message(
             }
             t.unwrap_or_default()
         }
+        // 10002 也可能是撤回 / 系统提示，先解出正文再判断。
+        _ if mtype & 0xFFFF_FFFF == 10002 => {
+            let mut t = decode_text(content);
+            if t.is_none() && !compress.is_empty() {
+                t = decode_text(compress);
+            }
+            t.unwrap_or_default()
+        }
         _ => String::new(),
     };
     let mut link_url = None;
@@ -461,6 +484,18 @@ fn decode_message(
     if kind == "文字" || kind == "系统" {
         text = strip_sender_prefix(&text);
     }
+    // 撤回提示（系统消息 XML：<sysmsg type="revokemsg">）单独归为「撤回」，
+    // 交给引用列表保留；正文取其中的 content / replacemsg。
+    let system_like = kind == "系统" || mtype & 0xFFFF_FFFF == 10002;
+    if text.contains("revokemsg")
+        || (system_like && text.contains("撤回了一条消息"))
+    {
+        kind = "撤回".to_string();
+        text = extract_tag(&text, "content")
+            .or_else(|| extract_tag(&text, "replacemsg"))
+            .unwrap_or_else(|| "撤回了一条消息".to_string());
+        text = strip_sender_prefix(&text);
+    }
     if text.trim().is_empty() {
         if kind == "引用" {
             text = "[引用]".to_string();
@@ -477,15 +512,27 @@ fn parse_quote(xml: &str) -> Option<QuoteRef> {
     let start = open + xml[open..].find('>')? + 1;
     let end = xml[start..].find("</refermsg>")? + start;
     let body = &xml[start..end];
+    let msg_type = extract_tag(body, "type")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
     let mut content = extract_tag(body, "content").unwrap_or_default();
-    // 被引用的是链接 / 文件时 content 又是一段 XML，取它的标题即可。
+    // 群里的被引用内容常带 `wxid_xxx:` 前缀；图片 / 文件则是另一段 XML。
+    content = strip_sender_prefix(&content);
     if content.trim_start().starts_with('<') {
         if let Some(title) = extract_title(&content) {
             content = title;
         }
     }
+    // 图片引用没有可读正文，统一显示成「[图片]」，同时保留类型供定位使用。
+    if msg_type == 3 {
+        content = "[图片]".to_string();
+    }
     let from = extract_tag(body, "displayname").unwrap_or_default();
-    let from_usr = extract_tag(body, "fromusr").unwrap_or_default();
+    // 群聊里 fromusr 是群 username，chatusr 才是真正的发送人。
+    let from_usr = extract_tag(body, "chatusr")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| extract_tag(body, "fromusr"))
+        .unwrap_or_default();
     let create_time = extract_tag(body, "createtime")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
@@ -497,6 +544,7 @@ fn parse_quote(xml: &str) -> Option<QuoteRef> {
             from,
             from_usr,
             create_time,
+            msg_type,
         })
     }
 }
@@ -681,7 +729,28 @@ mod tests {
         assert_eq!(quote.from, "张三");
         assert_eq!(quote.from_usr, "wxid_a");
         assert_eq!(quote.create_time, 1_700_000_000);
+        assert_eq!(quote.msg_type, 1);
         assert!(parse_quote("<msg></msg>").is_none());
+    }
+
+    #[test]
+    fn image_quote_uses_group_member_and_image_type() {
+        let xml = "<msg><appmsg><title>退</title><type>57</type><refermsg>\
+                   <content>wxid_member:\n&lt;?xml version=\"1.0\"?&gt;\
+                   &lt;msg&gt;&lt;img aeskey=\"x\" /&gt;&lt;/msg&gt;</content>\
+                   <createtime>1700000000</createtime>\
+                   <displayname>锦鲤</displayname>\
+                   <fromusr>123@chatroom</fromusr>\
+                   <chatusr>wxid_member</chatusr>\
+                   <type>3</type></refermsg></appmsg></msg>";
+        let (kind, _, _, quote) = decode_message(49, xml.as_bytes(), &[]);
+        assert_eq!(kind, "引用");
+        let quote = quote.expect("quote");
+        assert_eq!(quote.msg_type, 3);
+        assert_eq!(quote.content, "[图片]");
+        // 群聊里 fromusr 是群，chatusr 才是被引用消息的发送人。
+        assert_eq!(quote.from_usr, "wxid_member");
+        assert_eq!(quote.from, "锦鲤");
     }
 
     #[test]
@@ -698,5 +767,23 @@ mod tests {
     fn missing_tags_are_none() {
         assert!(extract_title("<msg></msg>").is_none());
         assert!(extract_tag("<msg></msg>", "url").is_none());
+    }
+
+    #[test]
+    fn revoke_system_message_is_classified() {
+        let xml = "<?xml version=\"1.0\"?><sysmsg type=\"revokemsg\"><revokemsg>\
+                   <content>\"一羊迁徙\" 撤回了一条消息</content>\
+                   <revoketime>0</revoketime></revokemsg></sysmsg>";
+        let (kind, text, url, quote) = decode_message(10000, xml.as_bytes(), &[]);
+        assert_eq!(kind, "撤回");
+        assert_eq!(text, "\"一羊迁徙\" 撤回了一条消息");
+        assert!(url.is_none());
+        assert!(quote.is_none());
+
+        // 10002 的纯文本撤回提示也能识别。
+        let (kind, text, _, _) =
+            decode_message(10002, "wxid_x:\n\"程程\" 撤回了一条消息".as_bytes(), &[]);
+        assert_eq!(kind, "撤回");
+        assert!(text.contains("撤回了一条消息"), "{text}");
     }
 }

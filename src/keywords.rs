@@ -238,8 +238,13 @@ pub struct KeywordSettings {
     pub zodiac_variants: BTreeMap<String, String>,
 }
 
-impl Default for KeywordSettings {
-    fn default() -> Self {
+/// 内置默认关键词（当前这台机器上配置好的版本）。
+/// 换电脑 / 首次运行时没有本地配置文件，就直接使用这份。
+const DEFAULT_KEYWORDS: &str = include_str!("defaults/keywords.txt");
+
+impl KeywordSettings {
+    /// 源码里的兜底默认；解析本地 / 内置配置时作为基底。
+    fn builtin() -> Self {
         let mut items: HashMap<Field, Vec<String>> = HashMap::new();
         let mut put = |f: Field, v: &[&str]| {
             items.insert(f, v.iter().map(|s| s.to_string()).collect());
@@ -294,7 +299,18 @@ impl Default for KeywordSettings {
     }
 }
 
+impl Default for KeywordSettings {
+    fn default() -> Self {
+        KeywordSettings::embedded()
+    }
+}
+
 impl KeywordSettings {
+    /// 编译进 exe 的默认配置，以源码内置词表为兜底。
+    fn embedded() -> Self {
+        Self::parse_with_base(Self::builtin(), DEFAULT_KEYWORDS)
+    }
+
     pub fn get(&self, f: Field) -> &[String] {
         self.items.get(&f).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -316,6 +332,49 @@ impl KeywordSettings {
         }
         None
     }
+
+    /// 在给定基底上解析配置文件。本地文件缺字段时保留基底里的值。
+    fn parse_with_base(mut out: KeywordSettings, text: &str) -> KeywordSettings {
+        if !text.starts_with(MAGIC) {
+            return out;
+        }
+        let mut seen: HashSet<Field> = HashSet::new();
+        let mut zodiac_seen = false;
+        for line in text.lines().skip(1) {
+            let mut parts = line.splitn(3, '\t');
+            match parts.next() {
+                Some("kw") => {
+                    let Some(f) = parts.next().and_then(Field::from_key) else {
+                        continue;
+                    };
+                    let item = parts.next().map(unescape).unwrap_or_default();
+                    if seen.insert(f) {
+                        out.set(f, Vec::new());
+                    }
+                    if !item.is_empty() {
+                        if let Some(v) = out.items.get_mut(&f) {
+                            v.push(item);
+                        }
+                    }
+                }
+                Some("zodiac") => {
+                    if !zodiac_seen {
+                        out.zodiac_variants.clear();
+                        zodiac_seen = true;
+                    }
+                    if let (Some(v), Some(c)) = (parts.next(), parts.next()) {
+                        let v = unescape(v);
+                        let c = unescape(c);
+                        if !v.is_empty() && !c.is_empty() {
+                            out.zodiac_variants.insert(v, c);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 const MAGIC: &str = "wxv-keywords\t1";
@@ -329,8 +388,12 @@ fn store_path() -> PathBuf {
 
 pub fn load() -> KeywordSettings {
     let Ok(text) = fs::read_to_string(store_path()) else {
+        // 首次运行 / 换电脑：直接用编译进 exe 的默认配置。
         return KeywordSettings::default();
     };
+    if !text.starts_with(MAGIC) {
+        return KeywordSettings::default();
+    }
     parse(&text)
 }
 
@@ -377,47 +440,9 @@ pub fn serialize(settings: &KeywordSettings) -> String {
     out
 }
 
+/// 解析本地配置文件：缺字段时继承内置默认配置。
 pub fn parse(text: &str) -> KeywordSettings {
-    let mut out = KeywordSettings::default();
-    if !text.starts_with(MAGIC) {
-        return out;
-    }
-    let mut seen: HashSet<Field> = HashSet::new();
-    let mut zodiac_seen = false;
-    for line in text.lines().skip(1) {
-        let mut parts = line.splitn(3, '\t');
-        match parts.next() {
-            Some("kw") => {
-                let Some(f) = parts.next().and_then(Field::from_key) else {
-                    continue;
-                };
-                let item = parts.next().map(unescape).unwrap_or_default();
-                if seen.insert(f) {
-                    out.set(f, Vec::new());
-                }
-                if !item.is_empty() {
-                    if let Some(v) = out.items.get_mut(&f) {
-                        v.push(item);
-                    }
-                }
-            }
-            Some("zodiac") => {
-                if !zodiac_seen {
-                    out.zodiac_variants.clear();
-                    zodiac_seen = true;
-                }
-                if let (Some(v), Some(c)) = (parts.next(), parts.next()) {
-                    let v = unescape(v);
-                    let c = unescape(c);
-                    if !v.is_empty() && !c.is_empty() {
-                        out.zodiac_variants.insert(v, c);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
+    KeywordSettings::parse_with_base(KeywordSettings::embedded(), text)
 }
 
 fn escape(s: &str) -> String {
@@ -468,6 +493,17 @@ mod tests {
         assert!(s.get(Field::StakePrefix).contains(&"各".to_string()));
         assert!(s.get(Field::HongKong).contains(&"香港".to_string()));
         assert_eq!(s.zodiac_variants.get("免"), Some(&"兔".to_string()));
+    }
+
+    #[test]
+    fn default_uses_embedded_user_config() {
+        let s = KeywordSettings::default();
+        // 当前配置相对源码默认值做过的调整：特码组多了「特」，金额后缀是「米」。
+        assert!(s.get(Field::SpecialNumber).contains(&"特".to_string()));
+        assert!(s.get(Field::StakeSuffix).contains(&"米".to_string()));
+        assert!(!s.get(Field::StakeSuffix).contains(&"只".to_string()));
+        assert!(s.get(Field::TotalStake).contains(&"=".to_string()));
+        assert!(!s.get(Field::StakePrefix).contains(&"=".to_string()));
     }
 
     #[test]

@@ -81,6 +81,8 @@ pub struct QuoteRef {
     pub from_usr: String,
     /// 被引用消息的发送时间（秒级时间戳，0 = 未知）。
     pub create_time: i64,
+    /// 被引用消息的微信类型（1 = 文字，3 = 图片，49 = appmsg…）。
+    pub msg_type: i64,
 }
 
 /// 注单/消息列表的一行。

@@ -78,6 +78,9 @@ pub const FIELDS: &[FieldDef] = &[
     odd("three_in_three", "三中三赔率", "组合", 750.0),
     odd("three_in_two_liang", "三中二·中2赔率", "组合", 20.0),
     odd("three_in_two_sa", "三中二·中3赔率", "组合", 100.0),
+    // 风险列的名义倍率（与参考项目 xmt 一致）：三中二全中时实际敞口走 sa，
+    // 这一列按名义值算，只用于展示。
+    odd("three_in_two", "三中二名义赔率", "组合", 25.0),
     odd("special_hit", "特碰赔率", "组合", 160.0),
     rw("rw_two_in_two", "二中二回水(%)", "组合", 15.0),
     rw("rw_two_all_hit", "二全中回水(%)", "组合", 15.0),

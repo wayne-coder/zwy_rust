@@ -1,0 +1,10 @@
+wxv-replace	1
+rule	复试	复式
+rule	蓝色	蓝波
+rule	=中=	二中二
+rule	t	拖
+rule	三三	三中三
+rule	X	拖
+rule	✕	拖
+rule	x	拖
+rule	Ⅹ	拖
