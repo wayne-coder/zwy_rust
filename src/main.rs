@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth;
 mod avatars;
 mod bill_image;
 mod cache;
@@ -27,6 +28,9 @@ mod sqlite;
 mod times;
 mod ui;
 mod win_style;
+mod xiaoma_dup;
+mod xiaoma_merge;
+mod xiaoma_offsets;
 
 use eframe::egui;
 

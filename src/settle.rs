@@ -3,7 +3,8 @@
 //! 赔率与回水由 `odds::OddsSet` 传入（默认 / 分组 / 会员个性化在 odds 模块解析），
 //! 默认值与参考项目 `zwy_wails_v1` 保持一致。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{OnceLock, RwLock};
 
 use crate::convert::BetItem;
 use crate::draw::RegionDraw;
@@ -121,7 +122,58 @@ const ZODIACS: &[(&str, &[u32])] = &[
     ("羊", &[12, 24, 36, 48]),
 ];
 
+/// 服务器下发的「属性词 → 号码」映射（登录响应里的 `attrMap.words`）。
+///
+/// 键与 `zwy_wails_v1` 的 `attr_map_default.json` 一致：生肖名、尾数的裸数字、
+/// 五行、波色、合数单双、头数（`0头`）、单/双/大/小色、大小单双等。
+///
+/// 未登录 / 老服务器不下发时保持 None，全部回落到内置表。
+static ATTR_OVERRIDE: OnceLock<RwLock<Option<HashMap<String, Vec<u32>>>>> = OnceLock::new();
+
+fn attrs() -> &'static RwLock<Option<HashMap<String, Vec<u32>>>> {
+    ATTR_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+/// 用服务器下发的映射整表替换内置属性词表。
+pub fn set_attr_map(words: HashMap<String, Vec<u32>>) {
+    if words.is_empty() {
+        return;
+    }
+    *attrs().write().unwrap() = Some(words);
+}
+
+/// 退回内置属性词表（退出登录时调用）。
+pub fn clear_attr_map() {
+    *attrs().write().unwrap() = None;
+}
+
+fn attr_override(kw: &str) -> Option<Vec<u32>> {
+    let guard = attrs().read().ok()?;
+    guard.as_ref().and_then(|m| m.get(kw)).cloned()
+}
+
+fn override_has(kw: &str, n: u32) -> bool {
+    let Ok(guard) = attrs().read() else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .and_then(|m| m.get(kw))
+        .is_some_and(|v| v.contains(&n))
+}
+
+fn has_override() -> bool {
+    attrs().read().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// 号码的生肖。有服务器映射时**只认映射表**，不在两套表之间来回混用。
 pub fn zodiac_of(n: u32) -> Option<&'static str> {
+    if has_override() {
+        return ZODIACS
+            .iter()
+            .find(|(z, _)| override_has(z, n))
+            .map(|(z, _)| *z);
+    }
     ZODIACS
         .iter()
         .find(|(_, nums)| nums.contains(&n))
@@ -132,8 +184,22 @@ pub(crate) fn tail_of(n: u32) -> u32 {
     n % 10
 }
 
-pub fn zodiac_numbers(name: &str) -> Option<&'static [u32]> {
-    ZODIACS.iter().find(|(z, _)| *z == name).map(|(_, n)| *n)
+pub fn zodiac_numbers(name: &str) -> Option<Vec<u32>> {
+    if let Some(v) = attr_override(name) {
+        return Some(v);
+    }
+    ZODIACS
+        .iter()
+        .find(|(z, _)| *z == name)
+        .map(|(_, n)| n.to_vec())
+}
+
+/// 某个尾数覆盖的号码。映射表的尾数键是裸数字（`"3"`），与参考项目一致。
+pub fn tail_numbers(d: u32) -> Vec<u32> {
+    if let Some(v) = attr_override(&d.to_string()) {
+        return v;
+    }
+    (1..=49).filter(|n| tail_of(*n) == d).collect()
 }
 
 fn head_numbers(n: u32) -> Vec<u32> {
@@ -143,6 +209,14 @@ fn head_numbers(n: u32) -> Vec<u32> {
         let base = n * 10;
         (base..=base + 9).filter(|v| *v <= 49).collect()
     }
+}
+
+/// 某个头数覆盖的号码（映射表的键是 `0头`…`4头`）。
+pub fn head_group_numbers(d: u32) -> Vec<u32> {
+    if let Some(v) = attr_override(&format!("{d}头")) {
+        return v;
+    }
+    head_numbers(d)
 }
 
 fn static_attr(kw: &str) -> Option<&'static [u32]> {
@@ -198,6 +272,9 @@ fn static_attr(kw: &str) -> Option<&'static [u32]> {
 }
 
 pub(crate) fn attr_numbers(kw: &str) -> Option<Vec<u32>> {
+    if let Some(v) = attr_override(kw) {
+        return Some(v);
+    }
     match kw {
         "大" => return Some((25..=49).collect()),
         "小" => return Some((1..=24).collect()),
@@ -220,13 +297,13 @@ pub fn token_numbers(tok: &str) -> Vec<u32> {
         return Vec::new();
     }
     if let Some(nums) = zodiac_numbers(tok) {
-        return nums.to_vec();
+        return nums;
     }
     if let Some(d) = tok.strip_suffix('尾').and_then(|s| s.parse::<u32>().ok()) {
-        return (1..=49).filter(|n| tail_of(*n) == d).collect();
+        return tail_numbers(d);
     }
     if let Some(d) = tok.strip_suffix('头').and_then(|s| s.parse::<u32>().ok()) {
-        return head_numbers(d);
+        return head_group_numbers(d);
     }
     attr_numbers(tok).unwrap_or_default()
 }
@@ -400,11 +477,11 @@ fn flat_special_groups(content: &str) -> Vec<Vec<u32>> {
     let mut direct: Vec<u32> = Vec::new();
     for tok in pick_tokens(content) {
         if let Some(nums) = zodiac_numbers(tok) {
-            groups.push(nums.to_vec());
+            groups.push(nums);
             continue;
         }
         if let Some(d) = tok.strip_suffix('尾').and_then(|s| s.parse::<u32>().ok()) {
-            groups.push((1..=49).filter(|n| tail_of(*n) == d).collect());
+            groups.push(tail_numbers(d));
             continue;
         }
         if tok.chars().all(|c| c.is_ascii_digit()) {
@@ -441,7 +518,7 @@ pub fn zodiac_names() -> Vec<&'static str> {
 /// 号码的波色名（'红波' / '蓝波' / '绿波'），查不到返回 None。
 pub fn wave_of(n: u32) -> Option<&'static str> {
     for (name, kw) in [("红波", "红波"), ("蓝波", "蓝波"), ("绿波", "绿波")] {
-        if static_attr(kw).is_some_and(|nums| nums.contains(&n)) {
+        if attr_numbers(kw).is_some_and(|nums| nums.contains(&n)) {
             return Some(name);
         }
     }

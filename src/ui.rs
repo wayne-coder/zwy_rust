@@ -33,6 +33,8 @@ use crate::replacements::{self, Rule};
 use crate::settle;
 use crate::times;
 
+mod xiaoma_modals;
+
 const GREEN: Color32 = Color32::from_rgb(0x0A, 0x8F, 0x52);
 const GREEN_DEEP: Color32 = Color32::from_rgb(0x08, 0x73, 0x43);
 const GREEN_TINT: Color32 = Color32::from_rgb(0xE7, 0xF5, 0xEC);
@@ -43,12 +45,15 @@ const TEXT: Color32 = Color32::from_rgb(0x1B, 0x20, 0x27);
 const SUB: Color32 = Color32::from_rgb(0x7C, 0x85, 0x8F);
 const HOVER: Color32 = Color32::from_rgb(0xEC, 0xEF, 0xF1);
 const BORDER: Color32 = Color32::from_rgb(0xE1, 0xE5, 0xE9);
-// 顶部工具栏：深灰底 + 比底色略浅的按钮，文字统一白色。
-const TOOLBAR_BG: Color32 = Color32::from_rgb(0x54, 0x5C, 0x64);
-const TOOLBAR_BTN: Color32 = Color32::from_rgb(0x6B, 0x73, 0x7B);
-const TOOLBAR_BTN_HOVER: Color32 = Color32::from_rgb(0x7C, 0x84, 0x8C);
-const TOOLBAR_BTN_ACTIVE: Color32 = Color32::from_rgb(0x60, 0x68, 0x70);
-const TOOLBAR_BTN_OFF: Color32 = Color32::from_rgb(0x5E, 0x65, 0x6C);
+// 顶部工具栏：深色底，按钮比底色亮并带细边，禁用按钮无填充。文字统一白色。
+const TOOLBAR_BG: Color32 = Color32::from_rgb(0x2B, 0x31, 0x38);
+const TOOLBAR_BTN: Color32 = Color32::from_rgb(0x43, 0x4B, 0x54);
+const TOOLBAR_BTN_HOVER: Color32 = Color32::from_rgb(0x52, 0x5B, 0x65);
+const TOOLBAR_BTN_ACTIVE: Color32 = Color32::from_rgb(0x3A, 0x41, 0x49);
+const TOOLBAR_BTN_EDGE: Color32 = Color32::from_rgb(0x6B, 0x74, 0x7D);
+const TOOLBAR_BTN_EDGE_HOVER: Color32 = Color32::from_rgb(0x8A, 0x93, 0x9C);
+const TOOLBAR_OFF_EDGE: Color32 = Color32::from_rgb(0x4F, 0x58, 0x60);
+const TOOLBAR_OFF_TEXT: Color32 = Color32::from_rgb(0x8A, 0x93, 0x9C);
 const TOOLBAR_SUB: Color32 = Color32::from_rgb(0xD3, 0xD8, 0xDD);
 const HEAD_BG: Color32 = Color32::from_rgb(0xF7, 0xF8, 0xFA);
 const STRIPE: Color32 = Color32::from_rgb(0xFA, 0xFB, 0xFC);
@@ -91,6 +96,12 @@ const MONEY_RED: Color32 = Color32::from_rgb(0xB9, 0x1C, 0x1C);
 const SPECIAL_RED: Color32 = Color32::from_rgb(0xBB, 0x00, 0x00);
 const CELL_NO: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8);
 const SUBTOTAL_BG: Color32 = Color32::from_rgb(0xF8, 0xFA, 0xFC);
+// 出账单「金额」列里香港 / 老澳门拆分的小字徽章（对齐 SettlementBillView 的
+// .hk-tag / .old-tag：白底、浅色边框、红 / 琥珀文字，小字部分用灰色）。
+const TAG_HK: Color32 = Color32::from_rgb(0xDC, 0x26, 0x26);
+const TAG_HK_BORDER: Color32 = Color32::from_rgb(0xFE, 0xE2, 0xE2);
+const TAG_OLD: Color32 = Color32::from_rgb(0xD9, 0x77, 0x06);
+const TAG_OLD_BORDER: Color32 = Color32::from_rgb(0xFE, 0xF3, 0xC7);
 
 // 风险页对齐 zwy_wails_v1 右列面板用的那一套色值。
 const REF_HEAD_BG: Color32 = Color32::from_rgb(0xF5, 0xF8, 0xFC);
@@ -265,6 +276,36 @@ enum Page {
     Ledger,
     /// 风险：复刻参考项目右列面板（小码 / 特码 / 连肖 / 平特 / 平码）。
     Risk,
+}
+
+/// 小码的减额相关状态：减额表（`store`）与查重 / 减额 / 减额记录三个弹窗。
+#[derive(Default)]
+struct XmDeduct {
+    store: crate::xiaoma_offsets::Store,
+    dup_open: bool,
+    dup_region: usize,
+    dup_entries: Vec<crate::xiaoma_dup::DupEntry>,
+    /// 每个地区的重复组（录入 ≥ 2 条）
+    dup_groups: [Vec<crate::xiaoma_dup::DupGroup>; 3],
+    /// (地区, 组下标) 是否展开
+    dup_expanded: HashSet<(usize, usize)>,
+    /// 勾选的录入，下标是 `dup_entries` 的
+    deduct_open: bool,
+    deduct_region: usize,
+    deduct_threshold: String,
+    /// 打开「减额」弹窗时把焦点放到过滤条件输入框
+    deduct_focus_pending: bool,
+    deduct_hint: Option<String>,
+    /// 合并组合弹窗打开的是哪一个类型栏（下标见 xiaoma_modals::XM_TYPES）
+    merge_open: Option<usize>,
+    merge_result: Option<crate::xiaoma_merge::MergeOutput>,
+    merge_hint: Option<String>,
+    log_open: bool,
+    /// 勾选的减额记录，下标是 `store.log` 的
+    log_checked: HashSet<usize>,
+    /// 展开了全部明细的减额记录，下标是 `store.log` 的
+    log_expanded: HashSet<usize>,
+    log_hint: Option<String>,
 }
 
 /// 「风险」页面的五个页签。
@@ -539,6 +580,8 @@ pub struct ViewerApp {
     risk_xm_search: String,
     /// 「概率」明细弹窗
     risk_prob_open: bool,
+    /// 小码减额：减额表与查重 / 减额 / 减额记录弹窗
+    xm: XmDeduct,
     /// 连肖子页签规格（2/3/4/5），默认二连肖
     risk_lian_size: usize,
     /// 连肖每一栏各自的页码（1 起）
@@ -567,6 +610,24 @@ pub struct ViewerApp {
     info_code_keys: HashSet<crate::info_code::CodeKey>,
     info_hit_cache: HashMap<EditKey, (u64, Option<crate::info_code::OrderInfoHits>)>,
     info_rev: u64,
+
+    // 在线鉴权（与 zwy_wails_v1 共用服务器）
+    auth: crate::auth::Auth,
+    login_user: String,
+    login_pass: String,
+    login_remember: bool,
+    /// (是否错误, 文案)
+    login_msg: Option<(bool, String)>,
+    login_rx: Option<Receiver<crate::auth::LoginOutcome>>,
+    auth_open: bool,
+    pwd_old: String,
+    pwd_new: String,
+    pwd_confirm: String,
+    pwd_msg: Option<(bool, String)>,
+    pwd_rx: Option<Receiver<crate::auth::ChangeOutcome>>,
+    auth_refresh_rx: Option<Receiver<()>>,
+    /// 上一帧是否已登录：用来在被心跳踢下线时给出「登录已失效」的提示。
+    was_authenticated: bool,
 }
 
 /// 赔率设置对话框当前编辑的对象。
@@ -582,6 +643,9 @@ enum OddsScope {
 #[derive(Default)]
 struct BillSlice {
     amount: f64,
+    /// 该类别里属于香港 / 老澳门的金额
+    hk: f64,
+    old: f64,
     win: f64,
     win_stake: f64,
     rebate: f64,
@@ -591,7 +655,12 @@ struct BillSlice {
 /// 出账单的一行（一批注单）。
 struct LedgerBillRow {
     no: usize,
+    /// 来源注单在 `self.orders` 里的下标（序号格点击跳转用）。
+    idx: usize,
     amount: f64,
+    /// 金额里属于香港 / 老澳门的那一份（显示在金额后面的括号里）
+    hk: f64,
+    old: f64,
     win: f64,
     rebate: f64,
     /// 这一行里特码的中奖注额（列表视图「小计」行用）。
@@ -662,6 +731,8 @@ impl ViewerApp {
         let draws = draw::load();
         let draw_inputs = draw_inputs_from(&draws);
         let reference_filter = crate::reference::load();
+        let auth = crate::auth::Auth::new();
+        let (login_user, login_pass, login_remember) = auth.remembered();
         let mut app = Self {
             state: State::Loading,
             status: "正在启动…".to_string(),
@@ -775,6 +846,10 @@ impl ViewerApp {
             risk_xm_jump: String::new(),
             risk_xm_search: String::new(),
             risk_prob_open: false,
+            xm: XmDeduct {
+                store: crate::xiaoma_offsets::Store::load(),
+                ..Default::default()
+            },
             risk_lian_size: 2,
             risk_lian_pages: [1, 1, 1],
             risk_panel_desc: [false, false, false],
@@ -793,6 +868,20 @@ impl ViewerApp {
             info_code_keys: HashSet::new(),
             info_hit_cache: HashMap::new(),
             info_rev: 0,
+            auth,
+            login_user,
+            login_pass,
+            login_remember,
+            login_msg: None,
+            login_rx: None,
+            auth_open: false,
+            pwd_old: String::new(),
+            pwd_new: String::new(),
+            pwd_confirm: String::new(),
+            pwd_msg: None,
+            pwd_rx: None,
+            auth_refresh_rx: None,
+            was_authenticated: false,
         };
         app.rebuild_info_codes();
         app
@@ -1115,9 +1204,15 @@ impl ViewerApp {
             if let Some(t) = self.order_times.get(&edit_key(&r)) {
                 r.time = t.clone();
             }
-            // 引用 / 撤回都不参与注单转换，统一进「引用列表」独立窗口。
-            // 它优先于下面的占位过滤：正文就算是「1」也仍然保留。
-            if r.kind == "引用" || r.kind == "撤回" {
+            // 引用不参与注单转换，进「引用列表」独立窗口；优先于下面的占位过滤：
+            // 正文就算是「1」也仍然保留。
+            //
+            // 撤回消息不再进引用列表（用户 2026-11-25）：它既不是注单、也不再需要
+            // 留在这里查退款 / 改单，直接丢掉。
+            if r.kind == "撤回" {
+                continue;
+            }
+            if r.kind == "引用" {
                 let key = (
                     r.sort,
                     r.chat.clone(),
@@ -1554,12 +1649,15 @@ impl ViewerApp {
                     .size(11.5)
                     .color(SUB),
                 );
-                ui.label(
-                    RichText::new(format!("当前已保存：{}", draw_summary(&self.draws)))
-                        .size(10.5)
-                        .color(MUTED),
-                );
+                draw_summary_ui(ui, &self.draws, "当前已保存：");
                 ui.add_space(8.0);
+                // 加了 1-49 号码盘之后内容会变高：正文限高滚动，底部的确认按钮始终可见。
+                let body_h = (ctx.content_rect().height() * 0.72).max(320.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("draw_dialog_scroll")
+                    .max_height(body_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
 
                 for i in 0..3 {
                     egui::Frame::new()
@@ -1749,9 +1847,42 @@ impl ViewerApp {
                             if let Some(err) = &self.draw_paste_error[i] {
                                 ui.label(RichText::new(err).size(10.5).color(RED));
                             }
+                            // 1-49 号码盘：点一下把号码填进本区第一个空输入框；
+                            // 已经录进本区的号码变淡、点不动。
+                            ui.add_space(4.0);
+                            ui.horizontal_top(|ui| {
+                                ui.label(RichText::new("号码盘").size(10.0).color(SUB));
+                                ui.add_space(6.0);
+                                let used: Vec<u32> = self.draw_inputs[i]
+                                    .iter()
+                                    .filter_map(|s| s.trim().parse::<u32>().ok())
+                                    .collect();
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    for r in 0..7 {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 1.0;
+                                            for c in 0..7 {
+                                                let n = (r * 7 + c + 1) as u32;
+                                                if pick_ball(ui, n, used.contains(&n), 18.0) {
+                                                    if let Some(slot) = self.draw_inputs[i]
+                                                        .iter_mut()
+                                                        .find(|s| s.trim().is_empty())
+                                                    {
+                                                        *slot = format!("{n:02}");
+                                                        self.draw_error = None;
+                                                        self.draw_paste_error[i] = None;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                            });
                         });
                     ui.add_space(6.0);
                 }
+                    });
 
                 if let Some(e) = &self.draw_error {
                     ui.label(RichText::new(e).size(11.5).color(RED));
@@ -2039,10 +2170,17 @@ impl ViewerApp {
                                 });
                             });
                             ui.add_space(6.0);
-                            // 面板拉高后让录入框跟着长，而不是下面留一大片空白。
-                            let rows = ((ui.available_height() - 200.0) / 14.5)
-                                .clamp(14.0, 30.0) as usize;
+                            // 文本框限高并在内部滚动：内容再多也不会把窗口撑高，
+                            // 下面的「添加 / 清空信息码」按钮始终可见。
+                            // 预留 210px 给提示、错误行列表、按钮和提示语。
+                            let box_h = (ui.available_height() - 210.0).clamp(120.0, 460.0);
+                            let rows = ((box_h / 14.5) as usize).max(6);
                             let draft_id = egui::Id::unique("info_code_draft");
+                            egui::ScrollArea::vertical()
+                                .id_salt("info_code_draft_scroll")
+                                .max_height(box_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
                             // 和主页原文一样：右键会折叠选区，先把选区记下来，
                             // 菜单存续期间再恢复，复制 / 剪切 / 插入拖才有内容可用。
                             let prev_selection =
@@ -2210,6 +2348,7 @@ impl ViewerApp {
                             {
                                 self.info_sel_snapshot = None;
                             }
+                                });
                             ui.label(
                                 RichText::new(
                                     "不用写金额。没写地区的按左边选的地区算，「默认类型」只补给没写类型的行。",
@@ -2465,7 +2604,7 @@ impl ViewerApp {
         }
         let builder = egui::ViewportBuilder::default()
             .with_title("引用列表")
-            .with_inner_size([620.0, 680.0])
+            .with_inner_size([420.0, 360.0])
             .with_min_inner_size([420.0, 360.0]);
         let mut keep_open = true;
         let uid = egui::ViewportId::from_hash_of("reference_list");
@@ -2502,19 +2641,10 @@ impl ViewerApp {
     }
 
     fn reference_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("引用列表").font(bold_font(18.0)).color(TEXT));
-            count_text_pill(ui, &format!("{} 条", self.references.len()));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(tiny_button("关闭", SUB)).clicked() {
-                    self.reference_open = false;
-                    self.reference_popup = 0;
-                }
-            });
-        });
+      
         ui.label(
             RichText::new(
-                "引用 / 撤回类型的消息不会进入注单列表；这里保留引用内容与被引用原文，可一键定位回注单列表。",
+                "引用类型的消息不会进入注单列表；这里保留引用内容与被引用原文，可一键定位回注单列表。",
             )
             .size(11.0)
             .color(SUB),
@@ -2525,7 +2655,10 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.reference_search)
-                    .hint_text("搜索引用 / 被引用原文 / 发送人")
+                    .font(FontId::proportional(11.0))
+                    .margin(Margin::symmetric(4, 1))
+                    .align(Align2::LEFT_CENTER)
+                    .hint_text(RichText::new("搜索引用 / 被引用原文 / 发送人").size(9.0))
                     .desired_width(260.0),
             );
             if !self.reference_search.is_empty()
@@ -2556,8 +2689,8 @@ impl ViewerApp {
             );
         }
 
-        ui.add_space(4.0);
-        egui::CollapsingHeader::new("过滤设置")
+        ui.add_space(1.0);
+        egui::CollapsingHeader::new(RichText::new("过滤设置").size(11.0))
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(
@@ -2593,14 +2726,14 @@ impl ViewerApp {
                 });
                 ui.label(
                     RichText::new(
-                        "过滤规则保存后对下一次导入生效；引用 / 撤回类型消息固定只进入本列表。",
+                        "过滤规则保存后对下一次导入生效；引用类型消息固定只进入本列表。",
                     )
                     .size(10.0)
                     .color(SUB),
                 );
             });
 
-        ui.add_space(4.0);
+        ui.add_space(1.0);
         hairline(ui);
         ui.add_space(6.0);
 
@@ -2626,7 +2759,7 @@ impl ViewerApp {
             ui.vertical_centered(|ui| {
                 ui.label(
                     RichText::new(if self.references.is_empty() {
-                        "暂无引用 / 撤回消息"
+                        "暂无引用消息"
                     } else {
                         "没有匹配的引用"
                     })
@@ -2636,7 +2769,7 @@ impl ViewerApp {
                 if self.references.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new("导入注单后，引用与撤回消息会自动出现在这里。")
+                        RichText::new("导入注单后，引用消息会自动出现在这里。")
                             .size(10.5)
                             .color(MUTED),
                     );
@@ -2954,7 +3087,7 @@ impl ViewerApp {
                     }
                     ui.add_space(4.0);
                     let ready = matches!(self.state, State::Ready(_));
-                    if top_button_enabled(ui, "导入注单", 76.0, ready)
+                    if top_button_tone(ui, "导入注单", 76.0, ready, TOOLBAR_TONE_GREEN)
                         .on_hover_text("选择日期与时间段后导入消息")
                         .clicked()
                     {
@@ -2965,7 +3098,7 @@ impl ViewerApp {
                         self.clear_members.clear();
                     }
                     ui.add_space(4.0);
-                    if top_button_enabled(ui, "清空注单", 76.0, ready)
+                    if top_button_tone(ui, "清空注单", 76.0, ready, TOOLBAR_TONE_RED)
                         .on_hover_text("按会员清空注单；不勾选会员则清空全部")
                         .clicked()
                     {
@@ -3077,6 +3210,29 @@ impl ViewerApp {
                             self.keywords_open = false;
                             self.replacements_open = false;
                             self.reference_open = false;
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if top_button(ui, "授权", 52.0)
+                        .on_hover_text("查看当前账号、到期时间，修改密码或退出登录")
+                        .clicked()
+                    {
+                        self.auth_open = !self.auth_open;
+                        if self.auth_open {
+                            self.pwd_msg = None;
+                            self.pwd_old.clear();
+                            self.pwd_new.clear();
+                            self.pwd_confirm.clear();
+                            // 打开时后台刷新一次账号信息，免得显示旧的到期日。
+                            if self.auth_refresh_rx.is_none() {
+                                let auth = self.auth.clone();
+                                let (tx, rx) = channel();
+                                self.auth_refresh_rx = Some(rx);
+                                std::thread::spawn(move || {
+                                    auth.refresh();
+                                    let _ = tx.send(());
+                                });
+                            }
                         }
                     }
                 }
@@ -3337,7 +3493,10 @@ impl ViewerApp {
             let no = block.rows.len() + 1;
             let mut br = LedgerBillRow {
                 no,
+                idx: i,
                 amount: conv.total_stake,
+                hk: 0.0,
+                old: 0.0,
                 win: 0.0,
                 rebate: 0.0,
                 special_win_stake: 0.0,
@@ -3357,6 +3516,18 @@ impl ViewerApp {
                 let cat = bill_category(&bet.play);
                 let slice = br.cats.entry(cat).or_default();
                 slice.amount += bet.amount;
+                // 金额按彩种拆出香港 / 老澳门的部分（澳门是合计的隐含余量）。
+                match bet.lottery.as_str() {
+                    "香港" => {
+                        br.hk += bet.amount;
+                        slice.hk += bet.amount;
+                    }
+                    "老澳门" => {
+                        br.old += bet.amount;
+                        slice.old += bet.amount;
+                    }
+                    _ => {}
+                }
                 slice.rebate += ev.rebate;
                 if ev.hit {
                     slice.win += ev.win_amount;
@@ -3598,6 +3769,8 @@ impl ViewerApp {
                         rows.push(bill_image::BillRowImage {
                             no: row.no,
                             amount: slice.amount,
+                            hk: slice.hk,
+                            old: slice.old,
                             win: slice.win,
                             special_win_stake: 0.0,
                             breakdown: sorted_breakdown(&slice.breakdown),
@@ -3625,6 +3798,8 @@ impl ViewerApp {
                     .map(|r| bill_image::BillRowImage {
                         no: r.no,
                         amount: r.amount,
+                        hk: r.hk,
+                        old: r.old,
                         win: r.win,
                         special_win_stake: r.special_win_stake,
                         breakdown: sorted_breakdown(&r.breakdown),
@@ -3666,8 +3841,8 @@ impl ViewerApp {
                     .map(|r| reconcile::Batch {
                         no: r.no,
                         stake: r.amount,
-                        hk: 0.0,
-                        old: 0.0,
+                        hk: r.hk,
+                        old: r.old,
                         win: r.win,
                     })
                     .collect();
@@ -3984,8 +4159,9 @@ impl ViewerApp {
     fn ledger_ui(&mut self, ui: &mut egui::Ui) {
         let visible = self.visible_order_indices();
         let block_list = self.bill_blocks(&visible);
+        // 序号格点击后要跳到主页的注单消息：等这一帧画完再切页。
+        let mut jump: Option<usize> = None;
 
-        let draw_text = draw_summary(&self.draws);
         let today = Local::now().format("%Y-%m-%d").to_string();
         let mut category_view = self.ledger_category;
 
@@ -4079,18 +4255,7 @@ impl ViewerApp {
                             )
                             .wrap(),
                         );
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(draw_text.clone())
-                                    .size(11.0)
-                                    .color(if self.draws.any_ready() {
-                                        MONEY_BLUE
-                                    } else {
-                                        MUTED
-                                    }),
-                            )
-                            .wrap(),
-                        );
+                        draw_summary_ui(ui, &self.draws, "开奖：");
                         if category_view {
                             ui.add(
                                 egui::Label::new(
@@ -4126,14 +4291,75 @@ impl ViewerApp {
                         }
 
                         for (bi, block) in block_list.iter().enumerate() {
-                            bill_block_ui(ui, block, category_view, bi);
+                            let (_, hit) = bill_block_ui(ui, block, category_view, bi);
+                            if hit.is_some() {
+                                jump = hit;
+                            }
                             ui.add_space(18.0);
                         }
                     });
             });
+        if let Some(i) = jump {
+            self.jump_to_order(i);
+        }
+    }
+
+    /// 跳到主页的注单消息：选中这一条并滚动到它。
+    ///
+    /// 出账单序号格只带 `self.orders` 的下标；这里清掉成员筛选，保证这一条在
+    /// 主页列表里可见（分组筛选保留——它本来就在当前分组里）。
+    fn jump_to_order(&mut self, index: usize) -> bool {
+        let Some(row) = self.orders.get(index).cloned() else {
+            return false;
+        };
+        self.member_focus = None;
+        self.page = Page::Home;
+        let key = (
+            row.sort,
+            row.chat.clone(),
+            row.nick.clone(),
+            row.content.clone(),
+        );
+        let conv = self
+            .auto_converted
+            .get(&edit_key(&row))
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut conv = safe_convert(&row.content, &self.keywords, &self.replacements);
+                self.apply_doubt_override(&edit_key(&row), &mut conv);
+                conv
+            });
+        self.selected_order_key = Some(key);
+        self.edit_time = row.time.clone();
+        self.edit_text = row.content.clone();
+        self.selected_order_row = Some(row);
+        self.converted = Some(conv);
+        self.scroll_to_order = true;
+        true
     }
 
     // ---------------- 风险页面 ----------------
+
+    /// 当前范围里的分组：选中某个分组时只看它，否则看全部。
+    fn upline_groups(&self) -> impl Iterator<Item = &MemberGroup> {
+        self.groups
+            .iter()
+            .filter(|g| self.order_filter.as_deref().is_none_or(|n| g.name == n))
+    }
+
+    /// 这条注单消息是不是上家发的（上家标记在分组管理里设置）。
+    fn is_upline_msg(&self, row: &MsgRow) -> bool {
+        self.upline_groups()
+            .any(|g| g.is_upline(&row.chat, &row.sender))
+    }
+
+    /// 成员栏里的这个人是不是上家（联系人按 username，群成员按 (群, 成员)）。
+    fn is_upline_key(&self, key: &MemberKey) -> bool {
+        self.upline_groups().any(|g| match key {
+            MemberKey::Contact(c) => g.upline_contacts.contains(c),
+            MemberKey::Member(c, m) => g.upline_members.iter().any(|(gc, gm)| gc == c && gm == m),
+        })
+    }
 
     /// 当前注单转换出的全部注（忽略投注人），供风险面板汇总。
     /// 风险页要统计的注单：跟随主页的「分组」下拉框过滤。
@@ -4156,8 +4382,12 @@ impl ViewerApp {
                     self.apply_doubt_override(&edit_key(row), &mut c);
                     c
                 });
+            // 上家的注单在风险页按减额（负数）汇总。
+            let upline = self.is_upline_msg(row);
             for bet in conv.bets {
-                out.push(crate::risk::BetRow::new(bet, &row.time));
+                out.push(
+                    crate::risk::BetRow::new(bet, &row.time).with_upline(upline),
+                );
             }
         }
         out
@@ -4202,14 +4432,12 @@ impl ViewerApp {
                                 }
                             }
                         });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let color = if self.draws.any_ready() {
-                            MONEY_BLUE
-                        } else {
-                            MUTED
-                        };
-                        ui.label(RichText::new(draw_summary(&self.draws)).size(11.5).color(color));
-                    });
+                    // 开奖富样式不能放进 right_to_left 布局：里面的横向组会跟着
+                    // 从右往左排，整行顺序反过来（最后一个「特」跑到最前面）。
+                    // 先按宽度留白，再正常从左往右画，效果就是右对齐。
+                    let summary_w = draw_summary_width(ui.painter(), &self.draws, 17.0);
+                    ui.add_space((ui.available_width() - summary_w).max(0.0));
+                    draw_summary_ui(ui, &self.draws, "");
                 });
                 ui.add_space(4.0);
                 match self.risk_tab {
@@ -4226,6 +4454,103 @@ impl ViewerApp {
 
         if self.risk_prob_open {
             self.risk_probability_window(ui.ctx(), &bets, &mul_sep);
+        }
+        if self.xm.dup_open
+            || self.xm.deduct_open
+            || self.xm.log_open
+            || self.xm.merge_open.is_some()
+        {
+            let base = crate::risk::xiaoma(
+                &bets,
+                &self.draws,
+                &self.odds,
+                odds_group.as_deref(),
+                &mul_sep,
+            );
+            let rows = crate::xiaoma_offsets::apply_to_rows(base.clone(), &self.xm.store.offsets);
+            let draw_sets = [0, 1, 2].map(|r| xiaoma_modals::draw_set(&self.draws, r));
+            self.xm_modals(ui.ctx(), &rows, &draw_sets);
+        }
+    }
+
+    /// 小码减额的弹窗（减额 / 合并 / 查重 / 减额记录）。
+    /// `rows` 是减额后的小码行；`base` 是没有减额的小码行（「将影响 N 行」用）。
+    fn xm_modals(
+        &mut self,
+        ctx: &egui::Context,
+        rows: &[crate::risk::XiaoMaRow],
+        draw_sets: &[HashSet<String>; 3],
+    ) {
+        if self.xm.deduct_open {
+            let xm = &mut self.xm;
+            let close = xm_modal(
+                ctx,
+                "xm_deduct",
+                "投注额过滤 · 减额",
+                "只作用于小码面板，总账不受影响",
+                860.0,
+                // 高度固定为软件窗口高度的 95%。
+                Some(ctx.content_rect().height() * 0.95),
+                0.9,
+                |ui| xiaoma_modals::deduct_body(xm, rows, ui),
+            );
+            if close {
+                self.xm.deduct_open = false;
+            }
+        }
+        if let Some(ti) = self.xm.merge_open {
+            let title = format!("合并组合 - {}", xiaoma_modals::XM_TYPES[ti].0);
+            let subtitle = format!(
+                "已自动合并{}该类型栏的全部组合（恰好构成某个号码集合时压成一行）；复制出来的文本可直接粘到「组合减额」执行。",
+                XM_REGION_NAMES[self.xm.deduct_region]
+            );
+            let xm = &mut self.xm;
+            let close = xm_modal(
+                ctx,
+                "xm_merge",
+                &title,
+                &subtitle,
+                640.0,
+                // 与「减额」弹窗一致：固定为软件窗口高度的 95%。
+                Some(ctx.content_rect().height() * 0.95),
+                0.9,
+                |ui| xiaoma_modals::merge_body(xm, ui),
+            );
+            if close {
+                self.xm.merge_open = None;
+            }
+        }
+        if self.xm.dup_open {
+            let xm = &mut self.xm;
+            let close = xm_modal(
+                ctx,
+                "xm_dup",
+                "查重 · 三中三",
+                "只看，不减额。减额请用「减额」按钮",
+                760.0,
+                None,
+                0.9,
+                |ui| xiaoma_modals::dup_body(xm, draw_sets, ui),
+            );
+            if close {
+                self.xm.dup_open = false;
+            }
+        }
+        if self.xm.log_open {
+            let xm = &mut self.xm;
+            let close = xm_modal(
+                ctx,
+                "xm_log",
+                "减额记录",
+                "只作用于小码面板；撤回会把这一笔的金额原样加回去",
+                680.0,
+                None,
+                0.9,
+                |ui| xiaoma_modals::log_body(xm, ui),
+            );
+            if close {
+                self.xm.log_open = false;
+            }
         }
     }
 
@@ -4798,12 +5123,31 @@ impl ViewerApp {
                 if secondary_small_button(ui, "概率").clicked() {
                     self.risk_prob_open = true;
                 }
+                if secondary_small_button(ui, "减额").clicked() {
+                    self.xm.deduct_open = true;
+                    self.xm.deduct_focus_pending = true;
+                    self.xm.deduct_hint = None;
+                }
+                if secondary_small_button(ui, "查重").clicked() {
+                    let entries = crate::xiaoma_dup::build(bets, mul_sep);
+                    let groups = [0, 1, 2].map(|r| crate::xiaoma_dup::groups(&entries, r));
+                    self.xm.dup_entries = entries;
+                    self.xm.dup_groups = groups;
+                    self.xm.dup_expanded.clear();
+                    self.xm.dup_open = true;
+                }
+                if secondary_small_button(ui, "减额记录").clicked() {
+                    self.xm.log_open = true;
+                    self.xm.log_hint = None;
+                }
             });
         });
         ui.add_space(8.0);
 
-        let all_rows =
-            crate::risk::xiaoma(bets, &self.draws, &self.odds, odds_group, mul_sep);
+        let all_rows = crate::xiaoma_offsets::apply_to_rows(
+            crate::risk::xiaoma(bets, &self.draws, &self.odds, odds_group, mul_sep),
+            &self.xm.store.offsets,
+        );
         let has_any = !all_rows.is_empty();
         let query = self.risk_xm_search.trim().to_string();
         let region = self.risk_xm_region;
@@ -5082,6 +5426,11 @@ impl ViewerApp {
         keys.extend(contacts.into_iter().map(MemberKey::Contact));
         keys.extend(members.into_iter().map(|(c, m)| MemberKey::Member(c, m)));
         keys.sort_by(|a, b| name_of(a).cmp(&name_of(b)));
+        // 上家固定排在最上面，与普通会员之间画一条红线隔开。
+        let up_count = keys.iter().filter(|k| self.is_upline_key(k)).count();
+        let mut ordered: Vec<MemberKey> = Vec::with_capacity(keys.len());
+        ordered.extend(keys.iter().filter(|k| self.is_upline_key(k)).cloned());
+        ordered.extend(keys.iter().filter(|k| !self.is_upline_key(k)).cloned());
 
         let title = match &filter {
             Some(name) => format!("「{name}」"),
@@ -5108,7 +5457,20 @@ impl ViewerApp {
                     .id_salt("member_rail_scroll")
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        for key in &keys {
+                        for (ki, key) in ordered.iter().enumerate() {
+                            if up_count > 0 && ki == up_count && up_count < ordered.len() {
+                                ui.add_space(2.0);
+                                let (line, _) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 1.0),
+                                    Sense::hover(),
+                                );
+                                ui.painter().hline(
+                                    line.x_range(),
+                                    line.center().y,
+                                    Stroke::new(1.5, RED),
+                                );
+                                ui.add_space(2.0);
+                            }
                             let label = truncate_display(&name_of(key), 4);
                             let selected = self.member_focus.as_ref() == Some(key);
                             if rail_item(ui, &label, selected) {
@@ -5171,17 +5533,10 @@ impl ViewerApp {
                     let show_reasons = !reasons.is_empty();
                     let total_w = ui.available_width();
                     let body_h = ui.available_height();
-                    let (left_w, mid_w, reason_w) = if show_reasons {
-                        let left_w = 220.0;
-                        let reason_w = (total_w * 0.30).max(110.0);
-                        // 原文与明细间隔 3px；明细与原因栏之间仍是分隔线 + 10px。
-                        let mid_w = (total_w - left_w - reason_w - 14.0).max(180.0);
-                        (left_w, mid_w, reason_w)
-                    } else {
-                        let left_w = 220.0;
-                        let mid_w = (total_w - left_w - 3.0).max(160.0);
-                        (left_w, mid_w, 0.0)
-                    };
+                    // 明细列始终占满「原文」右侧的整块宽度：存疑原因改成明细上方
+                    // 的横幅（见下），不再挤占表格的宽度。
+                    let left_w = 220.0;
+                    let mid_w = (total_w - left_w - 3.0).max(160.0);
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.allocate_ui_with_layout(
@@ -5578,6 +5933,50 @@ impl ViewerApp {
                                             .sum()
                                     })
                                     .unwrap_or(0.0);
+                                if show_reasons {
+                                    // 存疑原因横幅：放在明细上方、占满明细列宽度。
+                                    // 以前是明细右侧的独立列（占 30% 宽度），会把表格
+                                    // 挤到只剩几列、要横向滚动才看得全。
+                                    let failed = status == OrderStatus::Failed;
+                                    let color = if failed { RED } else { BLUE_FG };
+                                    let title = format!(
+                                        "{}（{}）",
+                                        if failed { "失败原因" } else { "存疑原因" },
+                                        reasons.len()
+                                    );
+                                    egui::CollapsingHeader::new(
+                                        RichText::new(title).size(11.0).color(color),
+                                    )
+                                    .id_salt("doubt_reasons")
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("doubt_reason_scroll")
+                                            .max_height(72.0)
+                                            .auto_shrink([false, true])
+                                            .show(ui, |ui| {
+                                                for r in &reasons {
+                                                    ui.horizontal_top(|ui| {
+                                                        ui.label(
+                                                            RichText::new("•")
+                                                                .size(11.0)
+                                                                .color(color),
+                                                        );
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(r)
+                                                                    .size(10.5)
+                                                                    .color(color),
+                                                            )
+                                                            .wrap()
+                                                            .selectable(true),
+                                                        );
+                                                    });
+                                                }
+                                            });
+                                    });
+                                    ui.add_space(4.0);
+                                }
                                 ui.horizontal(|ui| {
                                     if let Some(out) = &converted {
                                         ui.label(
@@ -5676,48 +6075,6 @@ impl ViewerApp {
                                     });
                             },
                         );
-                        if show_reasons {
-                            separator_line(ui, body_h);
-                            ui.add_space(10.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(reason_w, body_h),
-                                Layout::top_down(Align::Min),
-                                |ui| {
-                                    ui.set_min_size(Vec2::new(reason_w, body_h));
-                                    let failed = status == OrderStatus::Failed;
-                                    let color = if failed { RED } else { BLUE_FG };
-                                    section_label(
-                                        ui,
-                                        if failed { "失败原因" } else { "存疑原因" },
-                                    );
-                                    ui.add_space(6.0);
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false, false])
-                                        .id_salt("doubt_reason_scroll")
-                                        .show(ui, |ui| {
-                                            for r in &reasons {
-                                                ui.horizontal_top(|ui| {
-                                                    ui.label(
-                                                        RichText::new("•")
-                                                            .size(11.0)
-                                                            .color(color),
-                                                    );
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            RichText::new(r)
-                                                                .size(10.5)
-                                                                .color(color),
-                                                        )
-                                                        .wrap()
-                                                        .selectable(true),
-                                                    );
-                                                });
-                                                ui.add_space(6.0);
-                                            }
-                                        });
-                                },
-                            );
-                        }
                     });
                 } else if let Some(key) = &self.member_focus {
                     let mut rows: Vec<&MsgRow> = self
@@ -6464,6 +6821,8 @@ impl ViewerApp {
         let mut close_clicked = false;
         let mut remove_contact: Option<String> = None;
         let mut remove_member: Option<(String, String)> = None;
+        let mut toggle_contact: Option<String> = None;
+        let mut toggle_member: Option<(String, String)> = None;
 
         egui::Window::new(format!("管理分组「{name}」"))
             .collapsible(false)
@@ -6475,7 +6834,7 @@ impl ViewerApp {
                 window_header_cursor(ui);
                 ui.label(
                     RichText::new(
-                        "移除分组内的联系人 / 群成员；只影响分组本身，不影响会员选择和已导入的注单。",
+                        "移除分组内的联系人 / 群成员；点「设为上家」后，他发的注单在风险页按减额抵扣（金额可为负）。只影响分组本身，不影响会员选择和已导入的注单。",
                     )
                     .size(11.5)
                     .color(SUB),
@@ -6514,6 +6873,12 @@ impl ViewerApp {
                                     if ui.add(tiny_button("移除", RED)).clicked() {
                                         remove_contact = Some(u.clone());
                                     }
+                                    let is_up = self.groups[idx].upline_contacts.contains(u);
+                                    let label = if is_up { "取消上家" } else { "设为上家" };
+                                    let color = if is_up { GOLD_FG } else { SUB };
+                                    if ui.add(tiny_button(label, color)).clicked() {
+                                        toggle_contact = Some(u.clone());
+                                    }
                                 });
                             });
                         }
@@ -6535,6 +6900,13 @@ impl ViewerApp {
                                     if ui.add(tiny_button("移除", RED)).clicked() {
                                         remove_member = Some(key.clone());
                                     }
+                                    let is_up =
+                                        self.groups[idx].upline_members.contains(key);
+                                    let label = if is_up { "取消上家" } else { "设为上家" };
+                                    let color = if is_up { GOLD_FG } else { SUB };
+                                    if ui.add(tiny_button(label, color)).clicked() {
+                                        toggle_member = Some(key.clone());
+                                    }
                                 });
                             });
                         }
@@ -6555,6 +6927,8 @@ impl ViewerApp {
         if let Some(u) = remove_contact {
             if self.groups[idx].contacts.remove(&u) {
                 changed = true;
+                // 移出分组的同时取消上家标记。
+                self.groups[idx].upline_contacts.remove(&u);
                 // 同步取消树形结构里的勾选。
                 self.selected_contacts.remove(&u);
             }
@@ -6562,9 +6936,22 @@ impl ViewerApp {
         if let Some(k) = remove_member {
             if self.groups[idx].members.remove(&k) {
                 changed = true;
+                self.groups[idx].upline_members.remove(&k);
                 self.selected_members.remove(&k);
                 self.expanded.insert(k.0.clone());
             }
+        }
+        if let Some(u) = toggle_contact {
+            if !self.groups[idx].upline_contacts.remove(&u) {
+                self.groups[idx].upline_contacts.insert(u);
+            }
+            changed = true;
+        }
+        if let Some(k) = toggle_member {
+            if !self.groups[idx].upline_members.remove(&k) {
+                self.groups[idx].upline_members.insert(k);
+            }
+            changed = true;
         }
         if changed {
             groups::save(&self.groups);
@@ -7474,12 +7861,15 @@ impl ViewerApp {
                 });
                 ui.add_space(8.0);
                 ui.label(RichText::new("原始文本").size(12.0).color(SUB));
+                let raw_id = ui.make_persistent_id("single_raw_edit");
                 let edit = ui.add(
                     egui::TextEdit::multiline(&mut self.single_raw)
+                        .id(raw_id)
                         .desired_width(f32::INFINITY)
                         .desired_rows(7)
                         .hint_text("粘贴或输入一条注单原文，例如：三中三06.26.44五十"),
                 );
+                text_edit_context_menu(ctx, raw_id, &mut self.single_raw, &edit);
                 if edit.changed() {
                     // 原文变了，旧结果不再对应当前输入。
                     self.single_preview = None;
@@ -8416,7 +8806,7 @@ impl ViewerApp {
                 RichText::new(
                     "本软件系记账软件，只能用于娱乐或技术探讨，不得用于赌博或其它非法用途，否则后果自负！",
                 )
-                .size(11.5)
+                .size(10.0)
                 .color(SUB),
             );
         });
@@ -8432,8 +8822,15 @@ impl Drop for ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll();
         let ctx = ui.ctx().clone();
+        self.poll_auth();
+        // 没登录（或心跳发现令牌失效）时只画登录页。
+        if !self.auth.authenticated() {
+            self.login_ui(&ctx);
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+        self.poll();
         self.poll_import();
         self.poll_monitor();
 
@@ -8450,7 +8847,7 @@ impl eframe::App for ViewerApp {
             .frame(
                 egui::Frame::new()
                     .fill(CARD)
-                    .inner_margin(Margin::symmetric(18, 6))
+                    .inner_margin(Margin::symmetric(18, 2))
                     .stroke(Stroke::new(1.0, BORDER)),
             )
             .show(ui, |ui| self.footer(ui));
@@ -8493,6 +8890,7 @@ impl eframe::App for ViewerApp {
                 self.reconcile_dialog(&ctx);
                 self.bill_export_dialog(&ctx);
                 self.info_code_dialog(&ctx);
+                self.auth_dialog(&ctx);
             });
 
         // 独立窗口：引用类型消息列表。
@@ -8506,6 +8904,306 @@ impl eframe::App for ViewerApp {
             // 监控期间定期唤醒：窗口最小化 / 空闲时也要能轮询到新引用并弹窗。
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+        // 心跳（60 秒）把会话判无效后，界面要能自己切回登录页。
+        ctx.request_repaint_after(Duration::from_secs(2));
+    }
+}
+
+impl ViewerApp {
+    /// 轮询登录 / 改密 / 刷新这些后台线程的结果。
+    fn poll_auth(&mut self) {
+        if let Some(rx) = &self.login_rx {
+            match rx.try_recv() {
+                Ok(out) => {
+                    self.login_rx = None;
+                    if out.success {
+                        self.login_msg = None;
+                        self.login_pass.clear();
+                        // 用服务器下发的属性词映射整表替换内置表，并重算已缓存的转换结果。
+                        if let Some(words) = self.auth.attr_words() {
+                            crate::settle::set_attr_map(words);
+                            self.recompute_all_conversions();
+                        }
+                    } else {
+                        // 语气由错误码决定：in_use / 尝试过多 / 令牌失效是「等一下」，
+                        // 用警告色；其余才是红色的错误。
+                        let warning = crate::auth::is_warning(&out.code);
+                        let mut text = out.message.clone();
+                        if out.retry_after_ms > 0 {
+                            text.push_str(&format!(
+                                "（{} 秒后可重试）",
+                                (out.retry_after_ms + 999) / 1000
+                            ));
+                        }
+                        self.login_msg = Some((!warning, text));
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.login_rx = None;
+                    self.login_msg = Some((true, "登录请求失败，请重试".to_string()));
+                }
+            }
+        }
+        if let Some(rx) = &self.pwd_rx {
+            match rx.try_recv() {
+                Ok(out) => {
+                    self.pwd_rx = None;
+                    if out.success {
+                        self.pwd_msg = Some((false, out.message.clone()));
+                        self.pwd_old.clear();
+                        self.pwd_new.clear();
+                        self.pwd_confirm.clear();
+                    } else {
+                        self.pwd_msg = Some((true, out.message.clone()));
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.pwd_rx = None;
+                    self.pwd_msg = Some((true, "请求失败，请重试".to_string()));
+                }
+            }
+        }
+        if let Some(rx) = &self.auth_refresh_rx {
+            match rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => self.auth_refresh_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        // 会话失效（心跳）后授权弹窗也要跟着关掉，并告诉用户为什么又回到登录页。
+        let now_authenticated = self.auth.authenticated();
+        if !now_authenticated {
+            if self.was_authenticated {
+                self.login_msg = Some((
+                    false,
+                    crate::auth::default_message("token_invalid").to_string(),
+                ));
+                // 会话没了就退回内置属性词表，别让上一段会话的映射继续算钱。
+                crate::settle::clear_attr_map();
+                self.recompute_all_conversions();
+            }
+            self.auth_open = false;
+        }
+        self.was_authenticated = now_authenticated;
+    }
+
+    /// 登录页：没登录时铺满整个窗口。
+    fn login_ui(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::unique("login_backdrop"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    screen,
+                    CornerRadius::ZERO,
+                    Color32::from_rgb(0x10, 0x18, 0x2B),
+                );
+                ui.allocate_rect(screen, Sense::hover());
+            });
+
+        egui::Window::new("login_panel")
+            .title_bar(false)
+            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([380.0, 300.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("账无忧 · 登录").size(20.0).strong().color(TEXT));
+                    ui.label(
+                        RichText::new(format!("服务器：{}", self.auth.server_url()))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(10.0);
+                ui.label(RichText::new("账号").size(12.0).color(SUB));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.login_user)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("请输入管理员提供的账号"),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("密码").size(12.0).color(SUB));
+                let pass_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.login_pass)
+                        .password(true)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("请输入密码"),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.login_remember, RichText::new("记住密码").size(11.5));
+                ui.add_space(6.0);
+                if let Some((is_error, msg)) = &self.login_msg {
+                    // 错误用红色；「被顶下线 / 已退出 / 尝试过多」用警告色。
+                    let color = if *is_error { RED } else { GOLD_FG };
+                    ui.label(RichText::new(msg).size(11.0).color(color));
+                }
+                let inflight = self.login_rx.is_some();
+                let enter = pass_resp.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| {
+                    if primary_button(
+                        ui,
+                        RichText::new(if inflight { "登录中…" } else { "登录" })
+                            .size(13.0)
+                            .color(Color32::WHITE),
+                        !inflight,
+                        CornerRadius::same(6),
+                        Vec2::new(140.0, 30.0),
+                    )
+                    .clicked()
+                        || (enter && !inflight)
+                    {
+                        self.submit_login();
+                    }
+                });
+            });
+    }
+
+    fn submit_login(&mut self) {
+        if self.login_rx.is_some() {
+            return;
+        }
+        let user = self.login_user.trim().to_string();
+        if user.is_empty() || self.login_pass.is_empty() {
+            self.login_msg = Some((true, "请输入账号和密码。".to_string()));
+            return;
+        }
+        let auth = self.auth.clone();
+        let pass = self.login_pass.clone();
+        let remember = self.login_remember;
+        let (tx, rx) = channel();
+        self.login_rx = Some(rx);
+        self.login_msg = None;
+        std::thread::spawn(move || {
+            let _ = tx.send(auth.login(&user, &pass, remember));
+        });
+    }
+
+    /// 「授权」弹窗：当前账号、到期时间、备注、服务器，以及改密 / 退出登录。
+    fn auth_dialog(&mut self, ctx: &egui::Context) {
+        if !self.auth_open {
+            return;
+        }
+        let state = self.auth.state();
+        let mut open = self.auth_open;
+        egui::Window::new("权限管理")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                window_header_cursor(ui);
+                ui.horizontal(|ui| {
+                    risk_stat_card(ui, "账号", &state.username, TEXT, 180.0);
+                    risk_stat_card(ui, "账号到期", &state.remaining_text, TEXT, 180.0);
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("备注：{}", if state.note.is_empty() { "—" } else { &state.note }))
+                        .size(11.5)
+                        .color(SUB),
+                );
+                ui.label(
+                    RichText::new(format!("服务器：{}", state.server_url))
+                        .size(10.5)
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("到期时间、账号问题都请联系管理员。")
+                        .size(10.5)
+                        .color(MUTED),
+                );
+                ui.add_space(8.0);
+                hairline(ui);
+                ui.add_space(8.0);
+                ui.label(RichText::new("修改密码").size(13.0).strong().color(TEXT));
+                ui.label(RichText::new("原密码").size(11.5).color(SUB));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pwd_old)
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label(RichText::new("新密码").size(11.5).color(SUB));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pwd_new)
+                        .password(true)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("至少 6 位"),
+                );
+                ui.label(RichText::new("确认新密码").size(11.5).color(SUB));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pwd_confirm)
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+                if let Some((err, msg)) = &self.pwd_msg {
+                    ui.label(
+                        RichText::new(msg)
+                            .size(11.0)
+                            .color(if *err { RED } else { GREEN_DEEP }),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let busy = self.pwd_rx.is_some();
+                    if primary_button(
+                        ui,
+                        RichText::new(if busy { "提交中…" } else { "修改密码" })
+                            .size(12.5)
+                            .color(Color32::WHITE),
+                        !busy,
+                        CornerRadius::same(6),
+                        Vec2::new(96.0, 28.0),
+                    )
+                    .clicked()
+                    {
+                        self.submit_password_change();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(tiny_button("退出登录", RED)).clicked() {
+                            self.auth.logout();
+                            self.auth_open = false;
+                            self.login_msg = Some((false, "已退出登录".to_string()));
+                        }
+                    });
+                });
+            });
+        self.auth_open = open;
+    }
+
+    fn submit_password_change(&mut self) {
+        if self.pwd_rx.is_some() {
+            return;
+        }
+        if self.pwd_old.is_empty() || self.pwd_new.is_empty() {
+            self.pwd_msg = Some((true, "请填写原密码和新密码。".to_string()));
+            return;
+        }
+        if self.pwd_new.chars().count() < 6 {
+            self.pwd_msg = Some((true, "新密码至少 6 位。".to_string()));
+            return;
+        }
+        if self.pwd_new != self.pwd_confirm {
+            self.pwd_msg = Some((true, "两次输入的新密码不一致。".to_string()));
+            return;
+        }
+        let auth = self.auth.clone();
+        let old = self.pwd_old.clone();
+        let new = self.pwd_new.clone();
+        let (tx, rx) = channel();
+        self.pwd_rx = Some(rx);
+        self.pwd_msg = None;
+        std::thread::spawn(move || {
+            let _ = tx.send(auth.change_password(&old, &new));
+        });
     }
 }
 
@@ -9039,9 +9737,45 @@ fn ghost_button_sized(
     )
 }
 
-/// 顶部深色工具栏的按钮：比底色浅一档，白字。
+/// 顶部工具栏按钮的一套配色：填充、悬停、按下、边框、悬停边框。
+#[derive(Clone, Copy)]
+struct ToolbarTone {
+    fill: Color32,
+    hover: Color32,
+    active: Color32,
+    edge: Color32,
+    hover_edge: Color32,
+}
+
+const TOOLBAR_TONE: ToolbarTone = ToolbarTone {
+    fill: TOOLBAR_BTN,
+    hover: TOOLBAR_BTN_HOVER,
+    active: TOOLBAR_BTN_ACTIVE,
+    edge: TOOLBAR_BTN_EDGE,
+    hover_edge: TOOLBAR_BTN_EDGE_HOVER,
+};
+
+/// 主操作（导入注单）：绿色实心。
+const TOOLBAR_TONE_GREEN: ToolbarTone = ToolbarTone {
+    fill: GREEN,
+    hover: GREEN_HOVER,
+    active: GREEN_ACTIVE,
+    edge: GREEN,
+    hover_edge: GREEN_HOVER,
+};
+
+/// 删除类操作（清空注单）：红色实心。
+const TOOLBAR_TONE_RED: ToolbarTone = ToolbarTone {
+    fill: RED_SOLID,
+    hover: RED_SOLID_HOVER,
+    active: RED_SOLID_ACTIVE,
+    edge: RED_SOLID,
+    hover_edge: RED_SOLID_HOVER,
+};
+
+/// 顶部深色工具栏的按钮：深底上的浅色按钮，白字；禁用时无填充、灰字、灰边。
 fn top_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
-    top_button_enabled(ui, text, width, true)
+    top_button_tone(ui, text, width, true, TOOLBAR_TONE)
 }
 
 fn top_button_enabled(
@@ -9050,13 +9784,22 @@ fn top_button_enabled(
     width: f32,
     enabled: bool,
 ) -> egui::Response {
+    top_button_tone(ui, text, width, enabled, TOOLBAR_TONE)
+}
+
+fn top_button_tone(
+    ui: &mut egui::Ui,
+    text: &str,
+    width: f32,
+    enabled: bool,
+    tone: ToolbarTone,
+) -> egui::Response {
     let mut style = (**ui.style()).clone();
     style.spacing.button_padding = Vec2::new(9.0, 2.0);
-    style.visuals.widgets.noninteractive.weak_bg_fill = TOOLBAR_BTN_OFF;
-    style.visuals.widgets.noninteractive.bg_fill = TOOLBAR_BTN_OFF;
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
-    style.visuals.widgets.noninteractive.fg_stroke =
-        Stroke::new(1.0, Color32::from_rgb(0xC3, 0xC8, 0xCD));
+    style.visuals.widgets.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
+    style.visuals.widgets.noninteractive.bg_fill = Color32::TRANSPARENT;
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, TOOLBAR_OFF_EDGE);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TOOLBAR_OFF_TEXT);
     ui.scope(|ui| {
         ui.set_style(style);
         styled_button_enabled(
@@ -9066,19 +9809,105 @@ fn top_button_enabled(
                 .color(if enabled {
                     Color32::WHITE
                 } else {
-                    Color32::from_rgb(0xC3, 0xC8, 0xCD)
+                    TOOLBAR_OFF_TEXT
                 }),
             enabled,
-            TOOLBAR_BTN,
-            TOOLBAR_BTN_HOVER,
-            TOOLBAR_BTN_ACTIVE,
-            Stroke::NONE,
-            Stroke::new(1.0, TOOLBAR_BTN_HOVER),
+            tone.fill,
+            tone.hover,
+            tone.active,
+            Stroke::new(1.0, tone.edge),
+            Stroke::new(1.0, tone.hover_edge),
             CornerRadius::same(6),
             Vec2::new(width, 22.0),
         )
     })
     .inner
+}
+
+/// 多行文本框的右键菜单：剪切 / 复制 / 粘贴 / 全选。
+/// `id` 必须是创建 `TextEdit` 时用 `.id(...)` 设置的那一个，才能读写它的光标与选区。
+fn text_edit_context_menu(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    response: &egui::Response,
+) {
+    response.context_menu(|ui| {
+        compact_context_menu(ui);
+        let state = egui::TextEdit::load_state(ctx, id);
+        let range = state
+            .as_ref()
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| {
+                let a = r.primary.index.0.min(r.secondary.index.0);
+                let b = r.primary.index.0.max(r.secondary.index.0);
+                (a, b)
+            });
+        let has_sel = range.is_some_and(|(a, b)| a < b);
+        let selected = match range {
+            Some((a, b)) if a < b => {
+                let start = text.char_indices().nth(a).map(|(i, _)| i).unwrap_or(text.len());
+                let end = text.char_indices().nth(b).map(|(i, _)| i).unwrap_or(text.len());
+                text[start..end].to_string()
+            }
+            _ => String::new(),
+        };
+
+        let mut set_caret: Option<usize> = None;
+        if ui
+            .add_enabled(has_sel, egui::Button::new("剪切").shortcut_text("Ctrl+X"))
+            .clicked()
+        {
+            ui.ctx().copy_text(selected.clone());
+            if let Some((a, b)) = range {
+                set_caret = Some(replace_chars(text, a, b, ""));
+            }
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_sel, egui::Button::new("复制").shortcut_text("Ctrl+C"))
+            .clicked()
+        {
+            ui.ctx().copy_text(selected.clone());
+            ui.close();
+        }
+        if ui.button("粘贴").on_hover_text("Ctrl+V").clicked() {
+            if let Some(pasted) = crate::clipboard::read_text() {
+                let (a, b) = range.unwrap_or_else(|| {
+                    let n = text.chars().count();
+                    (n, n)
+                });
+                set_caret = Some(replace_chars(text, a, b, &pasted));
+            }
+            ui.close();
+        }
+        if ui.button("全选").on_hover_text("Ctrl+A").clicked() {
+            let n = text.chars().count();
+            let mut st = state.clone().unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(n),
+            )));
+            st.store(ctx, id);
+            ui.close();
+        }
+
+        if let Some(caret) = set_caret {
+            let mut st = state.unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::one(
+                egui::text::CCursor::new(caret),
+            )));
+            st.store(ctx, id);
+        }
+    });
+}
+
+/// 把字符区间 `[a, b)` 换成 `with`，返回换完后光标应在的字符位置。
+fn replace_chars(text: &mut String, a: usize, b: usize, with: &str) -> usize {
+    let start = text.char_indices().nth(a).map(|(i, _)| i).unwrap_or(text.len());
+    let end = text.char_indices().nth(b).map(|(i, _)| i).unwrap_or(text.len());
+    text.replace_range(start..end, with);
+    a + with.chars().count()
 }
 
 /// 右键菜单统一缩小一档。
@@ -9875,7 +10704,15 @@ fn detail_table_row(
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     child.spacing_mut().item_spacing.x = 0.0;
     detail_text_cell(&mut child, widths[0], &item.lottery, TEXT, 13.5, true, row_h);
-    detail_text_cell(&mut child, widths[1], &item.play, TEXT, 13.5, true, row_h);
+    detail_text_cell(
+        &mut child,
+        widths[1],
+        &item.play,
+        detail_play_color(&item.play),
+        13.5,
+        true,
+        row_h,
+    );
     detail_content_cell(&mut child, widths[2], &item.content, mul_sep, row_h);
     detail_text_cell(
         &mut child,
@@ -10085,6 +10922,15 @@ fn detail_token_box(ui: &mut egui::Ui, token: &str) {
         });
 }
 
+/// 明细「玩法」列的文字色：与中奖明细的玩法徽章用同一套颜色，未知玩法用默认文字色。
+fn detail_play_color(play: &str) -> Color32 {
+    let (display, fg, _) = crate::win_style::badge(play);
+    if display.is_empty() {
+        return TEXT;
+    }
+    Color32::from_rgb(fg[0], fg[1], fg[2])
+}
+
 fn detail_token_color(token: &str) -> Color32 {
     if let Ok(n) = token.parse::<u32>() {
         if (1..=49).contains(&n) {
@@ -10260,27 +11106,160 @@ fn parse_draw_inputs(inputs: &[[String; 7]; 3]) -> Result<draw::Draws, String> {
     Ok(draws)
 }
 
-fn draw_summary(draws: &draw::Draws) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// 号码球的波色底：红波 / 蓝波 / 绿波，查不到用灰色。
+fn wave_ball_color(n: u32) -> Color32 {
+    crate::settle::wave_of(n).map(wave_color).unwrap_or(MUTED)
+}
+
+/// 一个波色号码球（开奖展示与号码盘共用）。`special` 时加一圈白描边。
+fn draw_number_ball(ui: &mut egui::Ui, n: u32, d: f32, special: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(d), Sense::hover());
+    let p = ui.painter();
+    p.circle_filled(rect.center(), d / 2.0, wave_ball_color(n));
+    if special {
+        p.circle_stroke(
+            rect.center(),
+            d / 2.0 - 1.0,
+            Stroke::new(1.5, Color32::WHITE),
+        );
+    }
+    p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{n:02}"),
+        bold_font(d * 0.52),
+        Color32::WHITE,
+    );
+}
+
+/// 开奖号码的富样式展示：地区 + 每个号码一个波色圆圈，特码加白圈。
+/// `prefix` 为空时不显示前缀；没有录入时显示「尚未录入开奖」。
+fn draw_summary_ui(ui: &mut egui::Ui, draws: &draw::Draws, prefix: &str) {
+    // 一个地区都没录入时不显示前缀，只留「尚未录入开奖」，避免出现
+    // 「开奖：尚未录入开奖」。
+    let any_ready = draws.macau.ready() || draws.hongkong.ready() || draws.old_macau.ready();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        if any_ready && !prefix.is_empty() {
+            ui.label(RichText::new(prefix).size(10.5).color(SUB));
+        }
+        let mut any = false;
+        for (i, (name, r)) in [
+            ("澳", &draws.macau),
+            ("港", &draws.hongkong),
+            ("老", &draws.old_macau),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if !r.ready() {
+                continue;
+            }
+            if any {
+                ui.add_space(6.0);
+            }
+            any = true;
+            // 每个彩种一个带边框的圆角框，一眼就能分开澳 / 港 / 老。
+            egui::Frame::new()
+                .stroke(Stroke::new(1.0, region_color(i)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(6, 1))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.label(
+                        RichText::new(*name)
+                            .size(9.5)
+                            .strong()
+                            .color(region_color(i)),
+                    );
+                    for &n in &r.draw {
+                        draw_number_ball(ui, n, 17.0, false);
+                    }
+                    ui.label(RichText::new("特").size(9.0).strong().color(SPECIAL_RED));
+                    if let Some(s) = r.special {
+                        draw_number_ball(ui, s, 17.0, true);
+                    }
+                });
+        }
+        if !any {
+            ui.label(RichText::new("尚未录入开奖").size(10.5).color(MUTED));
+        }
+    });
+}
+
+/// 开奖富样式在一行里的宽度（用于右侧对齐：放进 right_to_left 布局会被整体
+/// 反序，所以改为先留白再正常从左往右画）。
+fn draw_summary_width(p: &egui::Painter, draws: &draw::Draws, d: f32) -> f32 {
+    let mut w = 0.0f32;
+    let mut regions = 0;
     for (name, r) in [
         ("澳", &draws.macau),
         ("港", &draws.hongkong),
         ("老", &draws.old_macau),
     ] {
-        if r.ready() {
-            let nums: Vec<String> = r.draw.iter().map(|n| format!("{n:02}")).collect();
-            parts.push(format!(
-                "{name} {} 特 {:02}",
-                nums.join(" "),
-                r.special.unwrap_or(0)
-            ));
+        if !r.ready() {
+            continue;
         }
+        if regions > 0 {
+            // 彩种组之间的间距。
+            w += 6.0 + 3.0;
+        }
+        regions += 1;
+        let mut items = 1; // 地区字
+        w += text_width(p, name, &bold_font(9.5));
+        w += r.draw.len() as f32 * d;
+        items += r.draw.len();
+        w += text_width(p, "特", &bold_font(9.0));
+        items += 1;
+        if r.special.is_some() {
+            w += d;
+            items += 1;
+        }
+        w += (items - 1) as f32 * 3.0;
+        // 彩种框的左右内边距与边框（各 6px 内边距 + 1px 描边）。
+        w += 12.0 + 2.0;
     }
-    if parts.is_empty() {
-        "尚未录入开奖".to_string()
+    if regions == 0 {
+        return text_width(p, "尚未录入开奖", &FontId::proportional(10.5));
+    }
+    w
+}
+
+/// 号码盘上的一个球：点一下返回 true（由调用方填进输入框）。
+/// 已经录进本区的号码变淡、点不动；悬停显示生肖。
+fn pick_ball(ui: &mut egui::Ui, n: u32, used: bool, d: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
+    let p = ui.painter();
+    let base = wave_ball_color(n);
+    let fill = if used {
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 70)
     } else {
-        format!("开奖：{}", parts.join(" · "))
+        base
+    };
+    p.circle_filled(rect.center(), d / 2.0, fill);
+    if !used && resp.hovered() {
+        p.circle_stroke(
+            rect.center(),
+            d / 2.0 - 0.5,
+            Stroke::new(1.5, Color32::WHITE),
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{n:02}"),
+        bold_font(d * 0.52),
+        if used {
+            Color32::from_white_alpha(150)
+        } else {
+            Color32::WHITE
+        },
+    );
+    if let Some(z) = crate::settle::zodiac_of(n) {
+        resp.clone().on_hover_text(format!("{n:02} {z}"));
+    }
+    resp.clicked() && !used
 }
 
 fn fmt_money(v: f64) -> String {
@@ -10289,7 +11268,11 @@ fn fmt_money(v: f64) -> String {
 
 struct BillTableRow {
     no: usize,
+    /// 来源注单在 `self.orders` 里的下标（序号格点击跳转用）。
+    idx: usize,
     amount: f64,
+    hk: f64,
+    old: f64,
     win: f64,
     breakdown: Vec<(String, f64, f64)>,
 }
@@ -10740,6 +11723,95 @@ fn risk_region_tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool 
         Vec2::new(0.0, 24.0),
     )
     .clicked()
+}
+
+/// 小码减额弹窗的地区名（与 `risk::REGION_CHARS` 下标一致）
+const XM_REGION_NAMES: [&str; 3] = ["澳门", "香港", "老澳门"];
+
+/// 整数不带小数，否则保留两位。
+fn xm_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.2}", v)
+    }
+}
+
+/// 小码减额弹窗的外壳：遮罩 + 居中窗口 + 标题行（右上角关闭）。
+/// 点遮罩或「关闭」时返回 true。与「概率」弹窗同一套样式。
+fn xm_modal(
+    ctx: &egui::Context,
+    id: &'static str,
+    title: &str,
+    subtitle: &str,
+    width: f32,
+    // 固定整个弹窗的高度（像素）；None = 按内容自动撑开。
+    fixed_height: Option<f32>,
+    // 未固定高度时的正文限高比例。
+    body_ratio: f32,
+    body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut close = false;
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::unique(id))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let resp = ui.allocate_rect(
+                egui::Rect::from_min_size(screen.min, screen.size()),
+                Sense::click(),
+            );
+            ui.painter()
+                .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(70));
+            if resp.clicked() {
+                close = true;
+            }
+        });
+    let mut window = egui::Window::new(id)
+        .title_bar(false)
+        .order(egui::Order::Foreground)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(width);
+    if let Some(h) = fixed_height {
+        window = window.fixed_size([width, h]);
+    }
+    window
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .inner_margin(Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(width - 28.0);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(title).size(16.0).strong().color(TEXT));
+                            ui.label(RichText::new(subtitle).size(11.5).color(MUTED));
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if secondary_small_button(ui, "关闭").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    hairline(ui);
+                    ui.add_space(8.0);
+                    // 内容可能很长（组合一多就有几百行）：正文限高、超出就在窗口里滚动，
+                    // 不让窗口把整个界面撑出屏幕。
+                    // 固定高度的弹窗里，正文用剩下的全部高度；否则按屏幕比例限高。
+                    let max_h = if fixed_height.is_some() {
+                        ui.available_height()
+                    } else {
+                        ui.ctx().content_rect().height() * body_ratio
+                    };
+                    egui::ScrollArea::vertical()
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| body(ui));
+                });
+        });
+    close
 }
 
 fn secondary_small_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -11271,7 +12343,8 @@ fn bill_block_ui(
     block: &LedgerBillBlock,
     category_view: bool,
     index: usize,
-) -> egui::Rect {
+) -> (egui::Rect, Option<usize>) {
+    let mut clicked: Option<usize> = None;
     let resp = egui::Frame::new()
         .fill(CARD)
         .stroke(Stroke::new(1.0, Color32::from_rgb(0xE2, 0xE8, 0xF0)))
@@ -11294,6 +12367,7 @@ fn bill_block_ui(
                 .id_salt(format!("bill_block_{index}_{}", block.name))
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
+                        let mut table_id = 0usize;
                         if category_view {
                             let mut cats: BTreeMap<
                                 &'static str,
@@ -11312,7 +12386,10 @@ fn bill_block_ui(
                                     ));
                                     e.0.push(BillTableRow {
                                         no: row.no,
+                                        idx: row.idx,
                                         amount: slice.amount,
+                                        hk: slice.hk,
+                                        old: slice.old,
                                         win: slice.win,
                                         breakdown: sorted_breakdown(&slice.breakdown),
                                     });
@@ -11334,13 +12411,18 @@ fn bill_block_ui(
                                 let total_chunks = chunks.len();
                                 for (ci, chunk) in chunks.into_iter().enumerate() {
                                     ui.vertical(|ui| {
-                                        let w = draw_bill_table(
+                                        let (w, hit) = draw_bill_table(
                                             ui,
                                             chunk,
                                             None,
                                             Some(cat),
                                             0,
+                                            table_id,
                                         );
+                                        table_id += 1;
+                                        if hit.is_some() {
+                                            clicked = hit;
+                                        }
                                         if ci + 1 == total_chunks {
                                             ui.add_space(4.0);
                                             totals_box(ui, amount, win, rebate, w);
@@ -11356,7 +12438,10 @@ fn bill_block_ui(
                                     .iter()
                                     .map(|r| BillTableRow {
                                         no: r.no,
+                                        idx: r.idx,
                                         amount: r.amount,
+                                        hk: r.hk,
+                                        old: r.old,
                                         win: r.win,
                                         breakdown: sorted_breakdown(&r.breakdown),
                                     })
@@ -11364,13 +12449,18 @@ fn bill_block_ui(
                                 let amount: f64 = chunk.iter().map(|r| r.amount).sum();
                                 let special: f64 =
                                     chunk.iter().map(|r| r.special_win_stake).sum();
-                                draw_bill_table(
+                                let (_, hit) = draw_bill_table(
                                     ui,
                                     &rows,
                                     Some((amount, special)),
                                     None,
                                     if multi_col { 30 - chunk.len() } else { 0 },
+                                    table_id,
                                 );
+                                table_id += 1;
+                                if hit.is_some() {
+                                    clicked = hit;
+                                }
                                 ui.add_space(12.0);
                             }
                         }
@@ -11396,7 +12486,7 @@ fn bill_block_ui(
             }
             totals_bar(ui, block.amount, block.win, block.rebate);
         });
-    resp.response.rect
+    (resp.response.rect, clicked)
 }
 
 fn text_width(p: &egui::Painter, text: &str, font: &FontId) -> f32 {
@@ -11411,7 +12501,9 @@ fn draw_bill_table(
     subtotal: Option<(f64, f64)>,
     cat_title: Option<&str>,
     pad_rows: usize,
-) -> f32 {
+    // 同一帧里多张表共用序号格的交互 id，用这个序号区分。
+    table_id: usize,
+) -> (f32, Option<usize>) {
     let p = ui.painter();
     let hdr_font = bold_font(12.5);
     let no_font = FontId::proportional(13.0);
@@ -11423,7 +12515,7 @@ fn draw_bill_table(
     let mut win_w = text_width(p, "中奖", &hdr_font);
     for row in rows {
         no_w = no_w.max(text_width(p, &row.no.to_string(), &no_font));
-        amt_w = amt_w.max(text_width(p, &fmt_money(row.amount), &amount_font));
+        amt_w = amt_w.max(stake_cell_width(p, row.amount, row.hk, row.old, &amount_font));
         win_w = win_w.max(win_content_width(p, row.win, &row.breakdown));
     }
     if let Some((amount, special)) = subtotal {
@@ -11490,15 +12582,43 @@ fn draw_bill_table(
     y += head_h;
     ys.push(y);
 
+    // 序号格：数字用一个小方块包起来，点一下跳到主页对应的注单消息。
+    let mut clicked: Option<usize> = None;
     for row in rows {
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(x0, y),
+            egui::pos2(x1, y + row_h),
+        );
+        let resp = ui.interact(
+            cell,
+            ui.make_persistent_id(("bill_no", table_id, row.idx)),
+            Sense::click(),
+        );
+        let hovered = resp.hovered();
+        if resp.clicked() {
+            clicked = Some(row.idx);
+        }
+        let box_rect =
+            egui::Rect::from_center_size(cell.center(), Vec2::new(24.0, 18.0));
+        p.rect_filled(box_rect, CornerRadius::same(4), Color32::WHITE);
+        p.rect_stroke(
+            box_rect,
+            CornerRadius::same(4),
+            Stroke::new(1.0, if hovered { MONEY_BLUE } else { BILL_LINE }),
+            egui::StrokeKind::Inside,
+        );
         p.text(
-            egui::pos2((x0 + x1) / 2.0, y + row_h / 2.0),
+            cell.center(),
             Align2::CENTER_CENTER,
             row.no.to_string(),
             no_font.clone(),
-            CELL_NO,
+            if hovered { MONEY_BLUE } else { CELL_NO },
         );
-        draw_number_cell_at(p, x1, x2, y, row_h, row.amount, MONEY_BLUE);
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            resp.on_hover_text("点击跳到主页这条注单消息");
+        }
+        draw_stake_cell_at(p, x1, x2, y, row_h, row.amount, row.hk, row.old, MONEY_BLUE);
         draw_win_cell_at(p, x2, x3, y, row_h, row.win, &row.breakdown);
         y += row_h;
         ys.push(y);
@@ -11560,7 +12680,101 @@ fn draw_bill_table(
     p.vline(x1, egui::Rangef::new(body_top, rect.bottom()), line);
     p.vline(x2, egui::Rangef::new(body_top, rect.bottom()), line);
     p.rect_stroke(rect, CornerRadius::ZERO, line, egui::StrokeKind::Inside);
+    (w, clicked)
+}
+
+/// 金额单元格的总宽度：主金额 + 「(港N)」「(老N)」两段小字。
+fn stake_cell_width(
+    p: &egui::Painter,
+    amount: f64,
+    hk: f64,
+    old: f64,
+    main_font: &FontId,
+) -> f32 {
+    let small = FontId::proportional(11.5);
+    let tag = bold_font(11.5);
+    let mut w = text_width(p, &fmt_money(amount), main_font);
+    for (ch, v) in [("港", hk), ("老", old)] {
+        if v <= 0.0 {
+            continue;
+        }
+        // 2px 段间距 +「()」+ 徽章（字宽 + 左右各 2px 内边距/边框）+ 金额
+        w += 2.0
+            + text_width(p, "(", &small)
+            + text_width(p, ch, &tag)
+            + 4.0
+            + text_width(p, &fmt_money(v), &small)
+            + text_width(p, ")", &small);
+    }
     w
+}
+
+/// 金额单元格：`100(港50)(老20)`。
+/// 括号与括号里的金额是灰色小字，「港」「老」各按参考项目的小徽章样式上色
+/// （白底 + 浅色边框 + 红 / 琥珀文字）。
+#[allow(clippy::too_many_arguments)]
+fn draw_stake_cell_at(
+    p: &egui::Painter,
+    x0: f32,
+    x1: f32,
+    y: f32,
+    h: f32,
+    amount: f64,
+    hk: f64,
+    old: f64,
+    color: Color32,
+) {
+    let clip = p.with_clip_rect(egui::Rect::from_min_max(
+        egui::pos2(x0, y),
+        egui::pos2(x1, y + h),
+    ));
+    let cy = y + h / 2.0;
+    let main_font = bold_font(14.0);
+    let main = fmt_money(amount);
+    let mut pen = x0 + 8.0;
+    clip.text(
+        egui::pos2(pen, cy),
+        Align2::LEFT_CENTER,
+        &main,
+        main_font.clone(),
+        color,
+    );
+    pen += text_width(p, &main, &main_font);
+
+    let small = FontId::proportional(11.5);
+    let tag_font = bold_font(11.5);
+    for (ch, v, fg, border) in [
+        ("港", hk, TAG_HK, TAG_HK_BORDER),
+        ("老", old, TAG_OLD, TAG_OLD_BORDER),
+    ] {
+        if v <= 0.0 {
+            continue;
+        }
+        pen += 2.0;
+        clip.text(egui::pos2(pen, cy), Align2::LEFT_CENTER, "(", small.clone(), MUTED);
+        pen += text_width(p, "(", &small);
+
+        let tag_w = text_width(p, ch, &tag_font);
+        let r = egui::Rect::from_center_size(
+            egui::pos2(pen + tag_w / 2.0, cy),
+            egui::vec2(tag_w + 4.0, (h - 10.0).min(15.0)),
+        );
+        clip.rect_filled(r, CornerRadius::same(2), Color32::WHITE);
+        clip.rect_stroke(
+            r,
+            CornerRadius::same(2),
+            Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+        clip.text(r.center(), Align2::CENTER_CENTER, ch, tag_font.clone(), fg);
+        pen += tag_w + 4.0;
+
+        let num = fmt_money(v);
+        clip.text(egui::pos2(pen, cy), Align2::LEFT_CENTER, &num, small.clone(), MUTED);
+        pen += text_width(p, &num, &small);
+        clip.text(egui::pos2(pen, cy), Align2::LEFT_CENTER, ")", small.clone(), MUTED);
+        pen += text_width(p, ")", &small);
+    }
 }
 
 fn draw_number_cell_at(
@@ -11952,4 +13166,5 @@ fn truncate_display(s: &str, max: usize) -> String {
         out.push('…');
     }
     out
+
 }

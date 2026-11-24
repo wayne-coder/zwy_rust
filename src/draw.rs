@@ -34,10 +34,6 @@ impl Draws {
             _ => &self.macau,
         }
     }
-
-    pub fn any_ready(&self) -> bool {
-        self.macau.ready() || self.hongkong.ready() || self.old_macau.ready()
-    }
 }
 
 const MAGIC: &str = "wxv-draws\t1";

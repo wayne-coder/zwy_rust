@@ -45,6 +45,10 @@ pub struct MemberGroup {
     pub contacts: HashSet<String>,
     /// (群 username, 成员 username)
     pub members: HashSet<(String, String)>,
+    /// 上家（联系人会话 username）：他的注单在风险页按减额记。
+    pub upline_contacts: HashSet<String>,
+    /// 上家（群 username, 成员 username）。
+    pub upline_members: HashSet<(String, String)>,
 }
 
 impl MemberGroup {
@@ -61,6 +65,19 @@ impl MemberGroup {
     ) {
         self.contacts = contacts.clone();
         self.members = members.clone();
+        // 上家只在仍是本组成员时保留。
+        self.upline_contacts.retain(|u| self.contacts.contains(u));
+        self.upline_members.retain(|k| self.members.contains(k));
+    }
+
+    /// 这条消息是不是本组上家发的（联系人按 username，群成员按 (群, 成员)）。
+    pub fn is_upline(&self, chat: &str, sender: &str) -> bool {
+        self.upline_contacts.contains(sender)
+            || self.upline_contacts.contains(chat)
+            || self
+                .upline_members
+                .iter()
+                .any(|(c, m)| c == chat && m == sender)
     }
 
     /// 判断一条注单是否属于本分组：联系人会话或该群内指定成员发送的消息。

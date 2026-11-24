@@ -13,6 +13,9 @@ const S: f32 = 2.0; // 2x 渲染，导出更清晰
 pub struct BillRowImage {
     pub no: usize,
     pub amount: f64,
+    /// 金额里属于香港 / 老澳门的那一份（显示在金额后面的括号里）
+    pub hk: f64,
+    pub old: f64,
     pub win: f64,
     pub special_win_stake: f64,
     /// (玩法标签, 注额, 赔率)，按 play 顺序展示为彩色徽章。
@@ -59,6 +62,11 @@ const BAND_AMOUNT_BG: Col = [0xEC, 0xFD, 0xF5, 255];
 const BAND_AMOUNT_BORDER: Col = [0xD1, 0xFA, 0xE5, 255];
 const TOTALS_BG: Col = [0xE2, 0xE8, 0xF0, 255];
 const TITLE_DARK: Col = [0x47, 0x55, 0x69, 255];
+// 金额列里香港 / 老澳门拆分的小徽章（与界面同一套色值）。
+const TAG_HK: Col = [0xDC, 0x26, 0x26, 255];
+const TAG_HK_BORDER: Col = [0xFE, 0xE2, 0xE2, 255];
+const TAG_OLD: Col = [0xD9, 0x77, 0x06, 255];
+const TAG_OLD_BORDER: Col = [0xFE, 0xF3, 0xC7, 255];
 
 struct Fonts {
     regular: FontArc,
@@ -177,6 +185,60 @@ const BADGE_SIZE: f32 = 10.5 * S;
 const BADGE_PAD: f32 = 3.0 * S;
 const BADGE_H: f32 = 15.0 * S;
 const BADGE_GAP: f32 = 3.0 * S;
+
+/// 金额单元格宽度：主金额 + 「(港N)」「(老N)」两段小字。
+fn stake_width(amount: f64, hk: f64, old: f64, amount_font: f32, small: f32) -> f32 {
+    let mut w = text_width(&money(amount), amount_font, true);
+    for (ch, v) in [("港", hk), ("老", old)] {
+        if v <= 0.0 {
+            continue;
+        }
+        w += 2.0 * S
+            + text_width("(", small, false)
+            + text_width(ch, BADGE_SIZE, true)
+            + 4.0 * S
+            + text_width(&money(v), small, false)
+            + text_width(")", small, false);
+    }
+    w
+}
+
+/// 金额单元格：`100(港50)(老20)`，括号与金额是灰色小字，港 / 老是白底彩边的小徽章。
+fn draw_stake(
+    img: &mut RgbaImage,
+    x: f32,
+    cy: f32,
+    amount: f64,
+    hk: f64,
+    old: f64,
+    amount_font: f32,
+    small: f32,
+) {
+    let main = money(amount);
+    text_left(img, &main, x, cy, amount_font, BLUE, true);
+    let mut pen = x + text_width(&main, amount_font, true);
+    for (ch, v, fg, border) in [
+        ("港", hk, TAG_HK, TAG_HK_BORDER),
+        ("老", old, TAG_OLD, TAG_OLD_BORDER),
+    ] {
+        if v <= 0.0 {
+            continue;
+        }
+        pen += 2.0 * S;
+        text_left(img, "(", pen, cy, small, MUTED, false);
+        pen += text_width("(", small, false);
+        let bw = text_width(ch, BADGE_SIZE, true) + 4.0 * S;
+        let by = cy - BADGE_H / 2.0;
+        boxed(img, pen, by, bw, BADGE_H, [0xFF, 0xFF, 0xFF, 255], border);
+        text_center(img, ch, pen + bw / 2.0, cy, BADGE_SIZE, fg, true);
+        pen += bw;
+        let num = money(v);
+        text_left(img, &num, pen, cy, small, MUTED, false);
+        pen += text_width(&num, small, false);
+        text_left(img, ")", pen, cy, small, MUTED, false);
+        pen += text_width(")", small, false);
+    }
+}
 
 /// 中奖列的玩法徽章：显示名、文字色、边框色。
 fn badge_style(label: &str) -> (String, Col, Col) {
@@ -359,7 +421,7 @@ fn render_block(b: &BillBlockImage) -> RgbaImage {
         let mut win_w = text_width("中奖", head_font, true);
         for r in rows {
             no_w = no_w.max(text_width(&r.no.to_string(), no_font, false));
-            amt_w = amt_w.max(text_width(&money(r.amount), amount_font, true));
+            amt_w = amt_w.max(stake_width(r.amount, r.hk, r.old, amount_font, small));
             win_w = win_w.max(win_content_width(r.win, &r.breakdown, win_font, small));
         }
         if with_subtotal {
@@ -579,7 +641,7 @@ fn render_block(b: &BillBlockImage) -> RgbaImage {
             let mut yy = hy + head_h;
             for r in c.rows {
                 text_center(&mut img, &r.no.to_string(), (x0 + x1) / 2.0, yy + row_h / 2.0, no_font, CELL_NO, false);
-                text_left(&mut img, &money(r.amount), x1 + 8.0 * S, yy + row_h / 2.0, amount_font, BLUE, true);
+                draw_stake(&mut img, x1 + 8.0 * S, yy + row_h / 2.0, r.amount, r.hk, r.old, amount_font, small);
                 draw_win_content(
                     &mut img,
                     x2 + 8.0 * S,
@@ -664,7 +726,7 @@ fn render_block(b: &BillBlockImage) -> RgbaImage {
             let mut yy = content_top + head_h;
             for r in c.rows {
                 text_center(&mut img, &r.no.to_string(), (x0 + x1) / 2.0, yy + row_h / 2.0, no_font, CELL_NO, false);
-                text_left(&mut img, &money(r.amount), x1 + 8.0 * S, yy + row_h / 2.0, amount_font, BLUE, true);
+                draw_stake(&mut img, x1 + 8.0 * S, yy + row_h / 2.0, r.amount, r.hk, r.old, amount_font, small);
                 draw_win_content(
                     &mut img,
                     x2 + 8.0 * S,
@@ -783,6 +845,8 @@ mod tests {
                 BillRowImage {
                     no: 1,
                     amount: 100.0,
+                    hk: 0.0,
+                    old: 0.0,
                     win: 0.0,
                     special_win_stake: 0.0,
                     breakdown: Vec::new(),
@@ -790,6 +854,8 @@ mod tests {
                 BillRowImage {
                     no: 2,
                     amount: 50.0,
+                    hk: 30.0,
+                    old: 0.0,
                     win: 1500.0,
                     special_win_stake: 0.0,
                     breakdown: vec![("三中三".to_string(), 10.0, 750.0)],

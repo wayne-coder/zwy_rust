@@ -222,10 +222,10 @@ fn collect(
                 let compress = r.bytes(4);
                 let (kind, content, link_url, quote) =
                     decode_message(mtype, &content_bytes, &compress);
-                // 撤回提示是系统消息（发送人为空），不属于任何分组成员，
-                // 但它是退款 / 改单的关键线索，必须进引用列表。
+                // 撤回提示是系统消息（发送人为空），不属于任何分组成员；
+                // 它也不再进引用列表（用户 2026-11-25），按普通消息的成员过滤丢掉。
                 if let Some(f) = filter {
-                    if kind != "撤回" && !f.contains(&sender) {
+                    if !f.contains(&sender) {
                         continue;
                     }
                 }
@@ -485,7 +485,7 @@ fn decode_message(
         text = strip_sender_prefix(&text);
     }
     // 撤回提示（系统消息 XML：<sysmsg type="revokemsg">）单独归为「撤回」，
-    // 交给引用列表保留；正文取其中的 content / replacemsg。
+    // 导入时直接丢弃（2026-11-25 起不再进引用列表）；正文取其中的 content / replacemsg。
     let system_like = kind == "系统" || mtype & 0xFFFF_FFFF == 10002;
     if text.contains("revokemsg")
         || (system_like && text.contains("撤回了一条消息"))

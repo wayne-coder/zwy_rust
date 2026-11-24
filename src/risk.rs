@@ -28,6 +28,9 @@ pub struct BetRow {
     pub bet: BetItem,
     pub region: usize,
     pub time: String,
+    /// 上家的注单：风险页按减额（负数）参与汇总，没有对应号码 / 组合时也会
+    /// 造出一行负数。
+    pub upline: bool,
 }
 
 impl BetRow {
@@ -37,7 +40,19 @@ impl BetRow {
             bet,
             region,
             time: time.to_string(),
+            upline: false,
         }
+    }
+
+    /// 标记为上家注单。
+    pub fn with_upline(mut self, upline: bool) -> Self {
+        self.upline = upline;
+        self
+    }
+
+    /// 金额方向：普通会员 +1，上家 -1。
+    fn sign(&self) -> f64 {
+        if self.upline { -1.0 } else { 1.0 }
     }
 }
 
@@ -107,7 +122,12 @@ fn per_bet(bet: &BetItem) -> f64 {
     bet.amount.max(0.0) / bets
 }
 
-fn covered_numbers(content: &str) -> Vec<u32> {
+/// 每注金额带上方向：上家的每注是负数。
+fn per_bet_row(b: &BetRow) -> f64 {
+    per_bet(&b.bet) * b.sign()
+}
+
+pub(crate) fn covered_numbers(content: &str) -> Vec<u32> {
     let mut set = BTreeSet::new();
     for tok in settle::pick_tokens(content) {
         set.extend(settle::token_numbers(tok));
@@ -123,7 +143,7 @@ fn num_label(n: u32) -> String {
     format!("{n:02}{}", settle::zodiac_of(n).unwrap_or(""))
 }
 
-fn joined_numbers(nums: &[u32]) -> String {
+pub(crate) fn joined_numbers(nums: &[u32]) -> String {
     nums.iter()
         .map(|n| num_key(*n))
         .collect::<Vec<_>>()
@@ -140,7 +160,8 @@ fn add_hit_row(
     stake: f64,
     hit: bool,
 ) {
-    if stake <= 0.0 {
+    // 上家会把某一格减成负数，那一格也要出现在表里（用户要求支持负值）。
+    if stake.abs() < 1e-9 {
         return;
     }
     let e = map.entry(key).or_insert((0.0, false));
@@ -198,8 +219,8 @@ fn build_column(
         .iter()
         .filter(|b| b.region == region && list_matches(list, &b.bet.play))
     {
-        col.total_stake += b.bet.amount.max(0.0);
-        col.total_water += water_of(&b.bet, set);
+        col.total_stake += b.bet.amount.max(0.0) * b.sign();
+        col.total_water += water_of(&b.bet, set) * b.sign();
     }
 
     match list {
@@ -213,13 +234,13 @@ fn build_column(
                 if bet.attr_total {
                     let nums = covered_numbers(&bet.content);
                     if !nums.is_empty() {
-                        let per = bet.amount.max(0.0) / nums.len() as f64;
+                        let per = bet.amount.max(0.0) / nums.len() as f64 * b.sign();
                         for n in nums {
                             add_hit_row(&mut by_num, n.to_string(), per, draw.special == Some(n));
                         }
                     }
                 } else {
-                    let per = per_bet(bet);
+                    let per = per_bet_row(b);
                     for tok in settle::pick_tokens(&bet.content) {
                         for n in settle::token_numbers(tok) {
                             add_hit_row(&mut by_num, n.to_string(), per, draw.special == Some(n));
@@ -248,7 +269,7 @@ fn build_column(
                 .filter(|b| b.region == region && b.bet.play == "平码")
             {
                 let bet = &b.bet;
-                let per = per_bet(bet);
+                let per = per_bet_row(b);
                 for tok in settle::pick_tokens(&bet.content) {
                     for n in settle::token_numbers(tok) {
                         add_hit_row(&mut by_num, n.to_string(), per, draw6.contains(&n));
@@ -274,7 +295,7 @@ fn build_column(
                     && (b.bet.play == "平特" || b.bet.play == "四中一" || b.bet.play == "五中一")
             }) {
                 let bet = &b.bet;
-                let per = per_bet(bet);
+                let per = per_bet_row(b);
                 match bet.play.as_str() {
                     "平特" => {
                         for (key, nums) in flat_special_groups(&bet.content) {
@@ -342,7 +363,7 @@ fn build_column(
                     continue;
                 }
                 let picks = lian_zodiacs(&bet.content);
-                let per = per_bet(bet);
+                let per = per_bet_row(b);
                 for combo in string_combinations(&picks, size) {
                     let key = combo.join("-");
                     let hit = combo.iter().all(|z| winning.contains(z));
@@ -376,10 +397,7 @@ fn flat_special_groups(content: &str) -> Vec<(String, Vec<u32>)> {
             continue;
         }
         if let Some(d) = tok.strip_suffix('尾').and_then(|s| s.parse::<u32>().ok()) {
-            out.push((
-                tok.to_string(),
-                (1..=49u32).filter(|n| settle::tail_of(*n) == d).collect(),
-            ));
+            out.push((tok.to_string(), settle::tail_numbers(d)));
             continue;
         }
         if tok.chars().all(|c| c.is_ascii_digit()) {
@@ -436,7 +454,7 @@ fn lian_zodiacs(content: &str) -> BTreeSet<String> {
     out
 }
 
-fn combinations<T: Clone>(items: &[T], k: usize) -> Vec<Vec<T>> {
+pub(crate) fn combinations<T: Clone>(items: &[T], k: usize) -> Vec<Vec<T>> {
     if k == 0 || k > items.len() {
         return Vec::new();
     }
@@ -475,6 +493,8 @@ pub struct XiaoMaRow {
     pub key: String,
     /// 类型标签（二全中在展示上并入二中二）
     pub label: String,
+    /// 原始玩法（二全中与二中二同组合时分开，减额键要用它区分）
+    pub play: String,
     pub region: usize,
     pub stake: f64,
     /// 回水（统计卡片「总回水」用）
@@ -483,6 +503,8 @@ pub struct XiaoMaRow {
     pub profit: f64,
     pub hit: bool,
     pub time: String,
+    /// 减额表里有、但当前没有投注记录的行（只剩减额）
+    pub orphan: bool,
 }
 
 struct Agg {
@@ -514,7 +536,7 @@ pub fn xiaoma(
         let special = draw.special;
         let size = if play_idx == 0 || play_idx == 3 { 3 } else { 2 };
         let label = PLAY_LABELS[play_idx].to_string();
-        let per = per_bet(bet);
+        let per = per_bet_row(b);
         let rebate_rate = rebate_rate(&bet.play, set);
         for combo in bet_combos(bet, size, mul_sep) {
             let hits = combo.iter().filter(|n| draw6.contains(n)).count();
@@ -602,12 +624,14 @@ pub fn xiaoma(
                 key,
                 label,
                 region,
+                play: a.play.clone(),
                 stake: a.stake,
                 water: a.rebate,
                 risk: a.stake * nominal,
                 profit: a.stake - a.win - a.rebate,
                 hit: a.hit,
                 time: a.time,
+                orphan: false,
             }
         })
         .collect()
@@ -699,6 +723,10 @@ pub fn play_stats(bets: &[BetRow], region: Option<usize>, mul_sep: &str) -> [Pla
     let mut stats = [PlayStat::default(); 4];
     let mut seen: [BTreeSet<u64>; 4] = Default::default();
     for b in bets {
+        // 上家是抵扣方，不算实际下注覆盖。
+        if b.upline {
+            continue;
+        }
         if region.is_some_and(|r| b.region != r) {
             continue;
         }
@@ -762,6 +790,45 @@ mod tests {
             macau,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn upline_bets_deduct_and_create_negative_rows() {
+        let mut up = bet("三中三", "01,02,03", 10.0, 1.0);
+        up.upline = true;
+        let rows = xiaoma(&[up.clone()], &draws(), &OddsConfig::default(), None, "拖");
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].stake + 10.0).abs() < 1e-6, "{:?}", rows[0].stake);
+        assert!(rows[0].risk < 0.0);
+
+        // 普通会员 + 上家同时押同一组合：相抵。
+        let normal = bet("三中三", "01,02,03", 10.0, 1.0);
+        let rows = xiaoma(&[normal, up], &draws(), &OddsConfig::default(), None, "拖");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].stake.abs() < 1e-6);
+    }
+
+    #[test]
+    fn upline_special_row_can_go_negative() {
+        let mut up = bet("特码", "05", 100.0, 1.0);
+        up.upline = true;
+        let cols = panel(PanelList::Special, &[up], &draws(), &OddsConfig::default(), None, 2);
+        let col = &cols[0];
+        assert!((col.total_stake + 100.0).abs() < 1e-6);
+        let r5 = col.rows.iter().find(|r| r.key == "05").unwrap();
+        assert!((r5.stake + 100.0).abs() < 1e-6, "{:?}", r5.stake);
+        // 没被上家押到的号码仍是 0，不会凭空出现。
+        let r6 = col.rows.iter().find(|r| r.key == "06").unwrap();
+        assert!(r6.stake.abs() < 1e-6);
+    }
+
+    #[test]
+    fn upline_bets_excluded_from_probability_stats() {
+        let mut up = bet("三中三", "01,02,03", 10.0, 1.0);
+        up.upline = true;
+        let stats = play_stats(&[up], None, "拖");
+        assert_eq!(stats[0].total_bets, 0);
+        assert_eq!(stats[0].distinct, 0);
     }
 
     #[test]

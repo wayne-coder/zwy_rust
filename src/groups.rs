@@ -70,6 +70,22 @@ pub fn serialize(groups: &[MemberGroup]) -> String {
             out.push_str(member);
             out.push('\n');
         }
+        let mut up_contacts: Vec<&String> = g.upline_contacts.iter().collect();
+        up_contacts.sort();
+        for u in up_contacts {
+            out.push_str("upline-contact\t");
+            out.push_str(u);
+            out.push('\n');
+        }
+        let mut up_members: Vec<&(String, String)> = g.upline_members.iter().collect();
+        up_members.sort();
+        for (chat, member) in up_members {
+            out.push_str("upline-member\t");
+            out.push_str(chat);
+            out.push('\t');
+            out.push_str(member);
+            out.push('\n');
+        }
     }
     out
 }
@@ -110,8 +126,27 @@ pub fn parse(text: &str) -> Vec<MemberGroup> {
                     }
                 }
             }
+            Some("upline-contact") => {
+                if let (Some(i), Some(u)) = (current, parts.next()) {
+                    if !u.is_empty() {
+                        out[i].upline_contacts.insert(u.to_string());
+                    }
+                }
+            }
+            Some("upline-member") => {
+                if let (Some(i), Some(chat), Some(member)) = (current, parts.next(), parts.next()) {
+                    if !chat.is_empty() && !member.is_empty() {
+                        out[i].upline_members.insert((chat.to_string(), member.to_string()));
+                    }
+                }
+            }
             _ => {}
         }
+    }
+    // 上家必须仍是本组成员（分组改过之后，已经不存在的成员不再算上家）。
+    for g in &mut out {
+        g.upline_contacts.retain(|u| g.contacts.contains(u));
+        g.upline_members.retain(|k| g.members.contains(k));
     }
     out
 }
@@ -161,6 +196,36 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "B");
         assert!(groups[0].members.is_empty());
+    }
+
+    #[test]
+    fn uplines_round_trip() {
+        let mut g = MemberGroup {
+            name: "A".into(),
+            ..Default::default()
+        };
+        g.contacts.insert("wxid_c".into());
+        g.members.insert(("2@chatroom".into(), "wxid_m".into()));
+        g.upline_contacts.insert("wxid_c".into());
+        g.upline_members
+            .insert(("2@chatroom".into(), "wxid_m".into()));
+        let text = serialize(&[g]);
+        let back = parse(&text);
+        assert_eq!(back.len(), 1);
+        assert!(back[0].upline_contacts.contains("wxid_c"));
+        assert!(back[0]
+            .upline_members
+            .contains(&("2@chatroom".into(), "wxid_m".into())));
+        assert!(back[0].is_upline("wxid_c", "wxid_c"));
+        assert!(back[0].is_upline("2@chatroom", "wxid_m"));
+        assert!(!back[0].is_upline("2@chatroom", "wxid_other"));
+
+        // 成员被移出分组后，上家标记也跟着失效。
+        let mut g2 = back[0].clone();
+        g2.contacts.clear();
+        g2.members.clear();
+        g2.upline_contacts.retain(|u| g2.contacts.contains(u));
+        assert!(!g2.is_upline("wxid_c", "wxid_c"));
     }
 
     #[test]
