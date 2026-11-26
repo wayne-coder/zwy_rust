@@ -422,7 +422,8 @@ fn load(ctx: &egui::Context, tx: &Sender<Msg>) -> Result<AppData, String> {
     })?;
 
     // 记录密钥来源，用于界面提示
-    let key_source = if live_set.iter().any(|c| c.key == contact_spec.key) {
+    let key_live = live_set.iter().any(|c| c.key == contact_spec.key);
+    let key_source = if key_live {
         "微信进程内存".to_string()
     } else {
         "本地密钥缓存".to_string()
@@ -742,5 +743,6 @@ fn load(ctx: &egui::Context, tx: &Sender<Msg>) -> Result<AppData, String> {
         missing_avatars,
         elapsed_ms: started.elapsed().as_millis(),
         key_source,
+        key_live,
     })
 }

@@ -236,8 +236,23 @@ impl OddsConfig {
         &self.default[region]
     }
 
-    pub fn resolve_lottery(&self, member: &str, group: Option<&str>, lottery: &str) -> &OddsSet {
-        self.resolve(member, group, region_index(lottery))
+    /// 结算时取赔率：先按「会员来源身份」（`m:<会话>:<发送人>`）找覆盖，
+    /// 再退回旧的「昵称」覆盖，最后分组 / 默认。
+    ///
+    /// 同名但来自不同群聊 / 会话的会员因此可以各存一份覆盖；
+    /// 旧版按昵称保存的赔率仍然生效。
+    pub fn resolve_member(
+        &self,
+        identity: &str,
+        nick: &str,
+        group: Option<&str>,
+        region: usize,
+    ) -> &OddsSet {
+        let region = region.min(2);
+        if let Some(p) = self.members.get(identity) {
+            return &p[region];
+        }
+        self.resolve(nick, group, region)
     }
 }
 
@@ -402,6 +417,49 @@ mod tests {
         assert_eq!(back.resolve("张三", Some("A 组"), 1).value("two_in_two"), 70.0);
         assert_eq!(back.resolve("李四", Some("A 组"), 0).value("two_in_two"), 70.0);
         assert_eq!(back.resolve("王五", None, 0).value("two_in_two"), 66.0);
+    }
+
+    #[test]
+    fn resolve_member_prefers_identity_then_legacy_nick() {
+        let mut cfg = OddsConfig::default();
+        cfg.ensure_member("张三", None);
+        for region in 0..3 {
+            if let Some(v) = cfg.members.get_mut("张三").unwrap()[region]
+                .value_mut("two_in_two")
+            {
+                *v = 70.0;
+            }
+        }
+        // 旧版昵称覆盖仍然生效。
+        assert_eq!(
+            cfg.resolve_member("m:群1:wxid_a", "张三", None, 0)
+                .value("two_in_two"),
+            70.0
+        );
+        // 来源身份覆盖优先于昵称覆盖。
+        cfg.ensure_member("m:群2:wxid_a", None);
+        for region in 0..3 {
+            if let Some(v) = cfg.members.get_mut("m:群2:wxid_a").unwrap()[region]
+                .value_mut("two_in_two")
+            {
+                *v = 80.0;
+            }
+        }
+        assert_eq!(
+            cfg.resolve_member("m:群2:wxid_a", "张三", None, 0)
+                .value("two_in_two"),
+            80.0
+        );
+        assert_eq!(
+            cfg.resolve_member("m:群1:wxid_a", "张三", None, 0)
+                .value("two_in_two"),
+            70.0
+        );
+        assert_eq!(
+            cfg.resolve_member("m:群3:wxid_b", "李四", None, 0)
+                .value("two_in_two"),
+            66.0
+        );
     }
 
     #[test]

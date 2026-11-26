@@ -1,5 +1,5 @@
 //! 账无忧界面：
-//! - 主页：顶部按钮（选定会员 / 导入注单），左侧成员竖排 Tab，中间常驻注单消息列表，右侧注单详情面板；
+//! - 主页：顶部按钮分组（注单 / 对奖 / 设置），左侧成员竖排 Tab，中间常驻注单消息列表，右侧注单详情面板；
 //! - 选定会员页：联系人 / 群聊两个 Tab，群聊树形展开成员，全部可勾选；
 //! - 导入注单：弹窗设置日期与时段，导入后在所选时段内实时追加新消息。
 
@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveTime, TimeZone, Timelike};
 use jiff::civil::Date as JDate;
@@ -278,6 +278,17 @@ enum Page {
     Risk,
 }
 
+/// 「注单消息」面板的三个页签。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrderTab {
+    /// 正常注单（已撤回的不在这里）。
+    Active,
+    /// 引用类型消息。
+    References,
+    /// 已撤回的原消息（本地持久化记录）。
+    Revoked,
+}
+
 /// 小码的减额相关状态：减额表（`store`）与查重 / 减额 / 减额记录三个弹窗。
 #[derive(Default)]
 struct XmDeduct {
@@ -316,6 +327,15 @@ enum RiskTab {
     LianXiao,
     FlatSpecial,
     FlatNumber,
+}
+
+/// 特码「吃码上报」的两种口径。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeReportMode {
+    /// 风险下限：把低于阈值的号吃回阈值之上。
+    Risk,
+    /// 下注额上限：把超过上限的号吃回上限以内。
+    Amount,
 }
 
 impl RiskTab {
@@ -437,6 +457,10 @@ pub struct ViewerApp {
     /// 注单列表按哪个会员分组过滤；None = 全部
     order_filter: Option<String>,
     orders_state: OrdersState,
+    /// 注单消息面板当前页签。
+    order_tab: OrderTab,
+    /// 已撤回消息（持久化）：重新导入时据此过滤原消息。
+    revoked: HashMap<crate::revoked::RevokeKey, crate::revoked::RevokedRow>,
     last_update: String,
     import_rx: Option<Receiver<ImportMsg>>,
 
@@ -444,6 +468,8 @@ pub struct ViewerApp {
     selection_dirty: bool,
     monitor_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     monitor_rx: Option<Receiver<MonitorMsg>>,
+    /// 当前监控绑定的导入时段；时段改了要重启监控。
+    monitor_range: Option<(i64, i64)>,
 
     // 清空注单弹窗
     clear_open: bool,
@@ -451,7 +477,7 @@ pub struct ViewerApp {
     clear_members: HashSet<(String, String)>,
 
     // 主页成员条与详情面板
-    /// 左侧竖排选中的成员（详情面板显示该成员的消息）
+    /// 左侧竖排选中的成员（只筛左侧注单列表，不再占用右侧详情面板）
     member_focus: Option<MemberKey>,
     /// 点击的注单（详情面板展示该条消息）
     selected_order_key: Option<(i64, String, String, String)>,
@@ -475,6 +501,14 @@ pub struct ViewerApp {
     batch_replace_to: String,
     /// 批量替换针对的注单（弹窗开着时切换注单就不要误改另一条）
     batch_replace_target: Option<EditKey>,
+
+    // 原文「识别图片」：剪贴板截图 → 系统 OCR
+    /// 识别线程的结果（Ok = 文本，Err = 错误说明）
+    ocr_rx: Option<Receiver<Result<String, String>>>,
+    /// 发起识别时选中的注单；结果回来前已切换就丢弃，避免写进另一条原文
+    ocr_target: Option<(i64, String, String, String)>,
+    /// 识别状态：(提示文字, 是否错误)
+    ocr_msg: Option<(String, bool)>,
 
     // 开奖
     draws: draw::Draws,
@@ -517,6 +551,14 @@ pub struct ViewerApp {
     reference_msg: Option<String>,
     /// 引用窗口提示是否为错误（红色显示）
     reference_msg_error: bool,
+    /// 注单列表里找不到被引用消息时，从微信库补读的后台结果。
+    quote_fetch_rx: Option<Receiver<Result<Vec<MsgRow>, String>>>,
+    /// 发起补读的那条引用消息（回来后再按正文 / 发送人匹配）。
+    quote_fetch_row: Option<MsgRow>,
+    /// 这次补读是为了删除被引用消息（而不是定位）。
+    quote_fetch_delete: bool,
+    /// 补读到、但不在当前注单列表里的被引用原文（弹窗展示，不参与记账）。
+    quote_original: Option<MsgRow>,
     /// 详情面板里正在编辑的原文
     edit_text: String,
     /// 详情面板里正在编辑的注单时间
@@ -591,6 +633,17 @@ pub struct ViewerApp {
     /// 三栏折叠状态：老澳门默认收起
     risk_collapsed: [bool; 3],
 
+    // 特码「吃码上报」
+    code_report_open: bool,
+    code_report_region: usize,
+    code_report_mode: CodeReportMode,
+    code_report_threshold: String,
+    code_report_limit: String,
+    /// 当前地区的号码 → 吃码金额输入（字符串，提交时再解析 / 夹取）
+    code_report_reduce: HashMap<u32, String>,
+    /// 复制格式的反馈文字
+    code_report_msg: Option<String>,
+
     // 信息码
     info_codes: Vec<crate::info_code::InfoCodeEntry>,
     info_code_open: bool,
@@ -626,8 +679,16 @@ pub struct ViewerApp {
     pwd_msg: Option<(bool, String)>,
     pwd_rx: Option<Receiver<crate::auth::ChangeOutcome>>,
     auth_refresh_rx: Option<Receiver<()>>,
+    /// 当前窗口标题：版本号 + 账号 + 剩余时间；变化时才下发，避免每帧重设。
+    window_title: String,
     /// 上一帧是否已登录：用来在被心跳踢下线时给出「登录已失效」的提示。
     was_authenticated: bool,
+    /// 登录页微信状态：上次检测 Weixin.exe 的时间（进程快照要节流）。
+    wx_proc_checked: Option<Instant>,
+    /// 最近一次检测是否发现 Weixin.exe 在运行。
+    wx_proc_running: bool,
+    /// 微信从「未运行」变成「运行」后，隔几秒自动重检一次（等它自动登录完成）。
+    wx_auto_check_at: Option<Instant>,
 }
 
 /// 赔率设置对话框当前编辑的对象。
@@ -763,11 +824,14 @@ impl ViewerApp {
             order_keys: HashSet::new(),
             order_filter: None,
             orders_state: OrdersState::Idle,
+            order_tab: OrderTab::Active,
+            revoked: crate::revoked::load(),
             last_update: String::new(),
             import_rx: None,
             selection_dirty: true,
             monitor_stop: None,
             monitor_rx: None,
+            monitor_range: None,
             clear_open: false,
             clear_groups: HashSet::new(),
             clear_members: HashSet::new(),
@@ -810,8 +874,15 @@ impl ViewerApp {
             reference_search: String::new(),
             reference_msg: None,
             reference_msg_error: false,
+            quote_fetch_rx: None,
+            quote_fetch_row: None,
+            quote_fetch_delete: false,
+            quote_original: None,
             edit_text: String::new(),
             edit_time: String::new(),
+            ocr_rx: None,
+            ocr_target: None,
+            ocr_msg: None,
             source_sel_snapshot: None,
             pending_source_action: None,
             keywords: keywords::load(),
@@ -854,6 +925,13 @@ impl ViewerApp {
             risk_lian_pages: [1, 1, 1],
             risk_panel_desc: [false, false, false],
             risk_collapsed: [false, false, true],
+            code_report_open: false,
+            code_report_region: 0,
+            code_report_mode: CodeReportMode::Risk,
+            code_report_threshold: "-10000".to_string(),
+            code_report_limit: "5000".to_string(),
+            code_report_reduce: HashMap::new(),
+            code_report_msg: None,
             info_codes: crate::info_code::load(),
             info_code_open: false,
             info_code_draft: String::new(),
@@ -881,7 +959,12 @@ impl ViewerApp {
             pwd_msg: None,
             pwd_rx: None,
             auth_refresh_rx: None,
+            window_title: format!("账无忧 v{}", env!("CARGO_PKG_VERSION")),
             was_authenticated: false,
+            wx_proc_checked: None,
+            // 初值先取一次，避免「启动时微信本来就在运行」被当成刚启动而自动重检。
+            wx_proc_running: !crate::keyextract::weixin_pids().is_empty(),
+            wx_auto_check_at: None,
         };
         app.rebuild_info_codes();
         app
@@ -1113,6 +1196,50 @@ impl ViewerApp {
         }
     }
 
+    /// 「识别图片」的词库：关键词设置里的全部词 + 生肖 + 地区 / 金额 / 组合标记。
+    fn ocr_vocab(&self) -> std::collections::HashSet<String> {
+        crate::ocr::vocabulary(&self.keywords)
+    }
+
+    /// 「识别图片」后台线程的结果：成功就替换原文，失败只显示错误。
+    fn poll_ocr(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.ocr_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(text)) => {
+                // 识别期间切换了注单：结果属于上一条，不能写进当前原文。
+                if self.ocr_target.as_ref() == self.selected_order_key.as_ref() {
+                    let vocab = self.ocr_vocab();
+                    let (text, fixed) = crate::ocr::correct_text(&text, &vocab);
+                    let count = text.chars().filter(|c| !c.is_whitespace()).count();
+                    self.edit_text = text;
+                    let msg = if fixed > 0 {
+                        format!("已识别 {count} 字，按词库纠正 {fixed} 处，检查后点「提交」保存")
+                    } else {
+                        format!("已识别 {count} 字，检查后点「提交」保存")
+                    };
+                    self.ocr_msg = Some((msg, false));
+                }
+                self.ocr_target = None;
+                self.ocr_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.ocr_msg = Some((e, true));
+                self.ocr_target = None;
+                self.ocr_rx = None;
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.ocr_msg = Some(("识别线程异常退出".to_string(), true));
+                self.ocr_target = None;
+                self.ocr_rx = None;
+            }
+        }
+    }
+
     fn poll_import(&mut self) {
         let mut msgs = Vec::new();
         let mut disconnected = false;
@@ -1196,22 +1323,59 @@ impl ViewerApp {
     fn fill_orders(&mut self, rows: Vec<MsgRow>) {
         let filter = self.reference_filter.clone();
         let mut new_reference = false;
-        for mut r in rows {
-            // 这条消息保存过编辑后的原文：用保存的文本覆盖微信原文。
-            if let Some(edited) = self.order_edits.get(&edit_key(&r)) {
+        // 保存过编辑内容的，用编辑后的文本覆盖微信原文；撤回提示也按编辑后的
+        // 文本识别。先统一处理，再建立撤回匹配候选池。
+        let mut rows = rows;
+        for r in &mut rows {
+            if let Some(edited) = self.order_edits.get(&edit_key(r)) {
                 r.content = edited.clone();
             }
-            if let Some(t) = self.order_times.get(&edit_key(&r)) {
+            if let Some(t) = self.order_times.get(&edit_key(r)) {
                 r.time = t.clone();
+            }
+        }
+        // 本批里所有原消息（含被占位 / 链接规则过滤掉的、以及已撤回的）都是
+        // 撤回提示的匹配候选；撤回提示本身除外。已撤回的原消息虽然不再显示，
+        // 也必须留在候选池里，否则重新导入时会误把更早的同发送人消息当成
+        // 撤回目标，导致「已撤回」越导入越多。
+        let batch_seen = revoke_candidates(&rows);
+        let (self_wxid, name_to_usr) = match &self.state {
+            State::Ready(d) => {
+                // 撤回提示里的名字可能是备注名，也可能是群昵称：两种都映射到 username。
+                let mut map = HashMap::new();
+                let mut add = |usr: &str, name: &str| {
+                    if !usr.is_empty() && !name.is_empty() {
+                        map.entry(name.to_string()).or_insert_with(|| usr.to_string());
+                    }
+                };
+                for p in &d.contacts {
+                    add(&p.username, &p.display_name);
+                    add(&p.username, &p.nick_name);
+                }
+                for g in &d.groups {
+                    for m in &g.members {
+                        add(&m.username, &m.display_name);
+                        add(&m.username, &m.nick_name);
+                    }
+                }
+                add(&d.self_wxid, &d.self_name);
+                (d.self_wxid.clone(), map)
+            }
+            _ => (String::new(), HashMap::new()),
+        };
+        for r in rows {
+            // 撤回提示不进任何列表：先找出被撤回的原消息并记入「已撤回」，
+            // 同时把它从当前注单列表里移除。
+            if r.kind == "撤回" {
+                self.handle_revoke(&r, &batch_seen, &self_wxid, &name_to_usr);
+                continue;
+            }
+            // 已撤回名单里的原消息：重新导入也不再出现。
+            if self.revoked.contains_key(&revoke_key_of(&r)) {
+                continue;
             }
             // 引用不参与注单转换，进「引用列表」独立窗口；优先于下面的占位过滤：
             // 正文就算是「1」也仍然保留。
-            //
-            // 撤回消息不再进引用列表（用户 2026-11-25）：它既不是注单、也不再需要
-            // 留在这里查退款 / 改单，直接丢掉。
-            if r.kind == "撤回" {
-                continue;
-            }
             if r.kind == "引用" {
                 let key = (
                     r.sort,
@@ -1263,6 +1427,71 @@ impl ViewerApp {
         }
     }
 
+    /// 处理一条撤回提示：找出被撤回的原消息，写入「已撤回」名单并从注单 /
+    /// 引用列表移除；写入后重新导入也会被过滤掉。
+    fn handle_revoke(
+        &mut self,
+        revoke: &MsgRow,
+        batch_seen: &[MsgRow],
+        self_wxid: &str,
+        name_to_usr: &HashMap<String, String>,
+    ) {
+        let Some(target) =
+            find_revoke_target(revoke, &self.orders, batch_seen, self_wxid, name_to_usr)
+        else {
+            return;
+        };
+        // 只处理当前导入时段内的原消息：撤回提示在时段内，但原消息可能是
+        // 上一次不同时段遗留在 self.orders 里的，不能顺手记成已撤回。
+        if let Some((start_ts, end_ts)) = self.import_range_ts() {
+            let start = start_ts.saturating_mul(1000);
+            let end = end_ts.saturating_mul(1000).saturating_add(999);
+            if target.sort < start || target.sort > end {
+                return;
+            }
+        }
+        let key = revoke_key_of(&target);
+        let record = crate::revoked::RevokedRow {
+            sort: target.sort,
+            chat: target.chat.clone(),
+            sender: target.sender.clone(),
+            time: target.time.clone(),
+            nick: target.nick.clone(),
+            kind: target.kind.clone(),
+            content: target.content.clone(),
+        };
+        if self.revoked.get(&key) != Some(&record) {
+            self.revoked.insert(key.clone(), record);
+            crate::revoked::save(&self.revoked);
+        }
+
+        // 从注单 / 引用里移除（被撤回的可能本来就不在列表里）。
+        let row_key = (
+            target.sort,
+            target.chat.clone(),
+            target.nick.clone(),
+            target.content.clone(),
+        );
+        self.orders.retain(|o| revoke_key_of(o) != key);
+        self.order_keys.remove(&row_key);
+        self.auto_converted.remove(&edit_key(&target));
+        self.info_hit_cache.clear();
+        self.references.retain(|r| revoke_key_of(r) != key);
+        self.reference_keys.remove(&row_key);
+        if self
+            .selected_order_row
+            .as_ref()
+            .is_some_and(|s| revoke_key_of(s) == key)
+        {
+            self.selected_order_row = None;
+            self.selected_order_key = None;
+            self.converted = None;
+            self.edit_text.clear();
+            self.edit_time.clear();
+            self.ocr_msg = None;
+        }
+    }
+
     /// 导入与监控的数据来源：
     /// - 已有会员分组时：**全部分组下的全部联系人 / 群成员**。每次导入都按当前
     ///   分组重新组装来源，新增的分组或新分配的会员会立即生效，并覆盖上一次的注单；
@@ -1279,8 +1508,20 @@ impl ViewerApp {
         source_from_groups(&self.groups, &HashSet::new(), &HashSet::new())
     }
 
+    /// 当前导入日期 / 时段对应的 Unix 秒区间。
+    fn import_range_ts(&self) -> Option<(i64, i64)> {
+        let date = chrono::NaiveDate::from_ymd_opt(
+            self.import_date.year() as i32,
+            self.import_date.month() as u32,
+            self.import_date.day() as u32,
+        )?;
+        messages::range_to_ts(date, self.import_start, self.import_end).ok()
+    }
+
     /// 选定会员 / 分组后常驻监控：有可读来源就运行；无来源则停止。
-    /// 监控只追加「从现在开始」的新消息，历史消息由「导入注单」负责回填。
+    ///
+    /// 监控也受「导入注单」里选的日期 / 时段限制：时段外的消息不会追加进来
+    /// （以前是只追加从现在开始的新消息，会把第二天的新消息也带进昨天的注单）。
     fn sync_monitor(&mut self, ctx: &egui::Context, data: &AppData) {
         let source = self.import_source();
         let has_source = !source.contacts.is_empty() || !source.groups.is_empty();
@@ -1292,7 +1533,25 @@ impl ViewerApp {
             return;
         }
 
-        if self.monitor_rx.is_none() || self.selection_dirty {
+        let Some((start_ts, end_ts)) = self.import_range_ts() else {
+            self.stop_monitor();
+            self.selection_dirty = false;
+            return;
+        };
+        let range = (start_ts, end_ts);
+        let range_changed = self.monitor_range != Some(range);
+
+        // 导入时段已经结束：不再启动监控，否则时段外的消息会被追加。
+        if Local::now().timestamp() > end_ts {
+            if self.monitor_rx.is_some() || self.monitor_stop.is_some() {
+                self.stop_monitor();
+            }
+            self.monitor_range = Some(range);
+            self.selection_dirty = false;
+            return;
+        }
+
+        if self.monitor_rx.is_none() || self.selection_dirty || range_changed {
             let req = ImportRequest {
                 account_dir: data.account_path.clone(),
                 workdir: data.workdir.clone(),
@@ -1300,8 +1559,8 @@ impl ViewerApp {
                 contacts: source.contacts,
                 groups: source.groups.into_iter().collect(),
                 name_of: build_name_map(data),
-                start_ts: 0,
-                end_ts: i64::MAX,
+                start_ts,
+                end_ts,
             };
             self.stop_monitor();
             let since = Local::now().timestamp_millis();
@@ -1313,6 +1572,7 @@ impl ViewerApp {
             );
             self.monitor_stop = Some(stop);
             self.monitor_rx = Some(rx);
+            self.monitor_range = Some(range);
         }
         self.selection_dirty = false;
     }
@@ -2800,21 +3060,11 @@ impl ViewerApp {
             }
         });
         if let Some(row) = delete {
-            self.delete_quoted_message(&row);
-            // 按需求：删除被引用消息时，连同引用列表里的这条引用一起移除。
-            let key = (
-                row.sort,
-                row.chat.clone(),
-                row.nick.clone(),
-                row.content.clone(),
-            );
-            self.references.retain(|r| {
-                !(r.sort == key.0
-                    && r.chat == key.1
-                    && r.nick == key.2
-                    && r.content == key.3)
-            });
-            self.reference_keys.remove(&key);
+            if self.delete_quoted_message(&row, ui.ctx()) {
+                // 按需求：删除成功后，连同引用列表里的这条引用一起移除；
+                // 后台补读删除时等 poll_quote_fetch 成功后再移除。
+                self.remove_reference(&row);
+            }
         }
         if let Some(row) = locate {
             self.locate_quoted_message(&row, ui.ctx());
@@ -2853,52 +3103,133 @@ impl ViewerApp {
     }
 
     /// 删除被引用的那条注单消息（只影响当前列表，重新导入会恢复）。
-    fn delete_quoted_message(&mut self, row: &MsgRow) {
-        let Some(index) = self.find_quoted_order(row) else {
-            let target = row
-                .quote
-                .as_ref()
-                .map(|q| q.content.trim())
-                .unwrap_or("");
+    ///
+    /// 返回 `true` 表示已经删掉；返回 `false` 表示没删（找不到，或正在后台补读，
+    /// 调用方不要急着把引用从列表里移除）。
+    fn delete_quoted_message(&mut self, row: &MsgRow, ctx: &egui::Context) -> bool {
+        if let Some(index) = self.find_quoted_order(row) {
+            let target = self.orders[index].clone();
+            self.delete_order(&target);
+            self.reference_msg = Some(format!(
+                "已删除被引用消息（{} {}）",
+                target.time, target.nick
+            ));
+            self.reference_msg_error = false;
+            return true;
+        }
+        // 和定位一样：列表里匹配不上时回微信库补读再删（原文可能被编辑过，
+        // 或者正文被引用截断，只看正文会漏掉）。
+        self.start_quote_fetch(row, true, ctx);
+        false
+    }
+
+    /// 把一条引用从引用列表里移除。
+    fn remove_reference(&mut self, row: &MsgRow) {
+        let key = (
+            row.sort,
+            row.chat.clone(),
+            row.nick.clone(),
+            row.content.clone(),
+        );
+        self.references.retain(|r| {
+            !(r.sort == key.0
+                && r.chat == key.1
+                && r.nick == key.2
+                && r.content == key.3)
+        });
+        self.reference_keys.remove(&key);
+    }
+
+    /// 从微信消息库补读被引用原文（定位 / 删除共用）。
+    ///
+    /// 返回 `false` 表示没启动后台读取（没有时间 / 数据未加载 / 已有任务在跑），
+    /// 已经在 `reference_msg` 里给出原因。
+    fn start_quote_fetch(
+        &mut self,
+        row: &MsgRow,
+        for_delete: bool,
+        ctx: &egui::Context,
+    ) -> bool {
+        if self.quote_fetch_rx.is_some() {
+            self.reference_msg = Some("正在读取上一条被引用消息，请稍候…".to_string());
+            self.reference_msg_error = false;
+            return false;
+        }
+        let Some(quote) = row.quote.clone() else {
+            self.reference_msg = Some("这条引用没有可定位的原文。".to_string());
+            self.reference_msg_error = true;
+            return false;
+        };
+        let State::Ready(data) = &self.state else {
+            self.reference_msg = Some("数据尚未加载完成，无法读取被引用原文".to_string());
+            self.reference_msg_error = true;
+            return false;
+        };
+        if quote.create_time <= 0 {
             self.reference_msg = Some(format!(
                 "未在注单列表中找到被引用消息：{}",
-                truncate_display(target, 24)
+                truncate_display(quote.content.trim(), 24)
             ));
             self.reference_msg_error = true;
-            return;
+            return false;
+        }
+        // 注单列表只包含本次导入的会员 / 时段；被引用原文可能是链接、占位消息、
+        // 其它群成员或更早的消息，本来就不在列表里。直接回微信消息库补读。
+        let chat = row.chat.clone();
+        let is_group = chat.ends_with("@chatroom");
+        let req = ImportRequest {
+            account_dir: data.account_path.clone(),
+            workdir: data.workdir.clone(),
+            keys: data.keys.clone(),
+            contacts: if is_group { Vec::new() } else { vec![chat.clone()] },
+            groups: if is_group {
+                vec![(chat.clone(), Vec::new())]
+            } else {
+                Vec::new()
+            },
+            name_of: build_name_map(data),
+            start_ts: quote.create_time.saturating_sub(3),
+            end_ts: quote.create_time.saturating_add(3),
         };
-        let target = self.orders[index].clone();
-        self.delete_order(&target);
-        self.reference_msg = Some(format!(
-            "已删除被引用消息（{} {}）",
-            target.time, target.nick
-        ));
+        let (tx, rx) = channel();
+        self.quote_fetch_rx = Some(rx);
+        self.quote_fetch_row = Some(row.clone());
+        self.quote_fetch_delete = for_delete;
+        self.reference_msg = Some("正在从微信读取被引用消息…".to_string());
         self.reference_msg_error = false;
+        let ctx_repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::messages::run(&req, &|_| {}).map(|r| r.rows);
+            let _ = tx.send(result);
+            // 补读是在引用窗口（子视口）里发起的，结果由主窗口轮询。
+            ctx_repaint.request_repaint_of(egui::ViewportId::ROOT);
+        });
+        true
     }
 
     /// 在注单消息列表里找到并选中被引用的那条消息。
     ///
     /// 匹配顺序：正文完全一致 → 去掉空白后一致 → 正文包含；
     /// 再按同一会话、被引用发送人、时间做加权，避免群里同一句话多个人说过时选错。
+    /// 注单列表里没有时，回微信消息库按被引用时间补读一次。
     fn locate_quoted_message(&mut self, row: &MsgRow, ctx: &egui::Context) {
-        let Some(quote) = &row.quote else {
-            self.reference_msg = Some("这条引用没有可定位的原文。".to_string());
-            self.reference_msg_error = true;
+        if let Some(index) = self.find_quoted_order(row) {
+            self.select_order_index(index, ctx);
             return;
-        };
-        let target = quote.content.trim();
-        let Some(index) = self.find_quoted_order(row) else {
-            self.reference_msg = Some(format!(
-                "未在注单列表中找到被引用消息：{}",
-                truncate_display(target, 24)
-            ));
-            self.reference_msg_error = true;
-            return;
-        };
+        }
+        // 注单列表只包含本次导入的会员 / 时段；被引用原文可能是链接、占位消息、
+        // 其它群成员或更早的消息，本来就不在列表里。直接回微信消息库补读。
+        self.start_quote_fetch(row, false, ctx);
+    }
+
+    /// 选中注单列表里的第 `index` 条，并同步详情面板。
+    fn select_order_index(&mut self, index: usize, ctx: &egui::Context) {
         // 清掉成员 / 分组过滤，保证目标行一定在可见列表里。
         self.member_focus = None;
         self.order_filter = None;
         self.page = Page::Home;
+        // 从「引用」页签定位回来时切回注单列表，用户才看得到选中行。
+        self.order_tab = OrderTab::Active;
         let target_row = self.orders[index].clone();
         let key = (
             target_row.sort,
@@ -2924,6 +3255,7 @@ impl ViewerApp {
         self.edit_text = target_row.content.clone();
         self.selected_order_row = Some(target_row.clone());
         self.converted = Some(conv);
+        self.ocr_msg = None;
         self.scroll_to_order = true;
         self.reference_msg = Some(format!(
             "已定位到被引用消息（{} {}）",
@@ -2933,8 +3265,153 @@ impl ViewerApp {
         // 把主窗口拉到最前，用户能立刻看到选中行。
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
+            egui::ViewportCommand::Minimized(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Visible(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
             egui::ViewportCommand::Focus,
         );
+    }
+
+    /// 补读结果：匹配到原文后选中注单行；原文不在列表里则弹窗展示。
+    fn poll_quote_fetch(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.quote_fetch_rx else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(150));
+                return;
+            }
+            Err(TryRecvError::Disconnected) => Err("补读线程异常退出".to_string()),
+        };
+        self.quote_fetch_rx = None;
+        let for_delete = std::mem::take(&mut self.quote_fetch_delete);
+        let Some(row) = self.quote_fetch_row.take() else {
+            return;
+        };
+        let Some(quote) = row.quote.clone() else {
+            return;
+        };
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(e) => {
+                self.reference_msg = Some(format!("读取被引用消息失败：{e}"));
+                self.reference_msg_error = true;
+                return;
+            }
+        };
+        let Some(msg) = find_quote_in_rows(&rows, &row, &quote) else {
+            self.reference_msg = Some(format!(
+                "未在微信消息库中找到被引用消息：{}",
+                truncate_display(quote.content.trim(), 24)
+            ));
+            self.reference_msg_error = true;
+            return;
+        };
+        // 补读的消息如果本来就在注单列表里（只是正文被改过等原因没匹配上），
+        // 按 sort + 会话 + 发送人认回那一行。
+        let order_index = self
+            .orders
+            .iter()
+            .position(|o| o.sort == msg.sort && o.chat == msg.chat && o.sender == msg.sender);
+        if let Some(index) = order_index {
+            if for_delete {
+                let target = self.orders[index].clone();
+                self.delete_order(&target);
+                self.remove_reference(&row);
+                self.reference_msg = Some(format!(
+                    "已删除被引用消息（{} {}）",
+                    target.time, target.nick
+                ));
+                self.reference_msg_error = false;
+            } else {
+                self.select_order_index(index, ctx);
+            }
+            return;
+        }
+        if for_delete {
+            self.reference_msg = Some(format!(
+                "被引用原文不在当前注单列表，无法删除：{}",
+                truncate_display(quote.content.trim(), 24)
+            ));
+            self.reference_msg_error = true;
+            return;
+        }
+        self.reference_msg = Some(format!(
+            "已找到被引用原文（{} {}），它不在当前注单列表，已在弹窗中显示",
+            msg.time, msg.nick
+        ));
+        self.reference_msg_error = false;
+        self.quote_original = Some(msg);
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Minimized(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Visible(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Focus,
+        );
+    }
+
+    /// 补读到、但不在注单列表里的被引用原文。
+    fn quote_original_dialog(&mut self, ctx: &egui::Context) {
+        let Some(row) = self.quote_original.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("被引用原文")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(440.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                window_header_cursor(ui);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} {}", row.time, row.nick))
+                            .size(11.5)
+                            .color(SUB),
+                    );
+                    ui.label(RichText::new(&row.kind).size(11.0).color(MUTED));
+                });
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(STRIPE)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(380.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&row.content).size(12.5).color(TEXT),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
+                    });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "该消息不在当前注单列表（可能是链接、占位消息，或不在本次导入的时段 / 会员范围内）。",
+                    )
+                    .size(10.5)
+                    .color(MUTED),
+                );
+            });
+        if !open {
+            self.quote_original = None;
+        }
     }
 
     /// 「批量替换」弹窗：把原文里的查找串全部换成输入的内容。
@@ -3074,7 +3551,7 @@ impl ViewerApp {
 
     // ---------------- 顶部栏 ----------------
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
         let n_c = self.selected_contacts.len();
         let n_g = self.selected_groups.len();
         let n_m = self.selected_members.len();
@@ -3082,12 +3559,14 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             match self.page {
                 Page::Home => {
-                    if top_button(ui, "选定会员", 76.0).clicked() {
+                    // 按功能分组，从左到右依次是：注单操作 → 对奖查看 → 规则设置。
+                    top_group_label(ui, "注单", "选择会员、导入 / 清空注单与查看引用");
+                    if top_button(ui, "选定会员", 70.0).clicked() {
                         self.page = Page::Select;
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     let ready = matches!(self.state, State::Ready(_));
-                    if top_button_tone(ui, "导入注单", 76.0, ready, TOOLBAR_TONE_GREEN)
+                    if top_button_tone(ui, "导入注单", 70.0, ready, TOOLBAR_TONE_GREEN)
                         .on_hover_text("选择日期与时间段后导入消息")
                         .clicked()
                     {
@@ -3097,8 +3576,8 @@ impl ViewerApp {
                         self.clear_groups.clear();
                         self.clear_members.clear();
                     }
-                    ui.add_space(4.0);
-                    if top_button_tone(ui, "清空注单", 76.0, ready, TOOLBAR_TONE_RED)
+                    ui.add_space(2.0);
+                    if top_button_tone(ui, "清空注单", 70.0, ready, TOOLBAR_TONE_RED)
                         .on_hover_text("按会员清空注单；不勾选会员则清空全部")
                         .clicked()
                     {
@@ -3107,64 +3586,7 @@ impl ViewerApp {
                         self.clear_groups.clear();
                         self.clear_members.clear();
                     }
-                    ui.add_space(4.0);
-                    if top_button(ui, "关键词", 60.0)
-                        .on_hover_text("玩法关键词 / 金额识别 / 区域 & 其他")
-                        .clicked()
-                    {
-                        self.keywords_open = true;
-                        self.dialog_open = false;
-                        self.clear_open = false;
-                        self.replacements_open = false;
-                    }
-                    ui.add_space(4.0);
-                    if top_button(ui, "替换词", 60.0)
-                        .on_hover_text("转换前把 A 词替换为 B 词")
-                        .clicked()
-                    {
-                        self.replacements_open = true;
-                        self.dialog_open = false;
-                        self.clear_open = false;
-                        self.keywords_open = false;
-                    }
-                    ui.add_space(4.0);
-                    if top_button(ui, "赔率", 52.0)
-                        .on_hover_text("设置默认 / 分组 / 会员的赔率与回水")
-                        .clicked()
-                    {
-                        self.odds_draft = self.odds.clone();
-                        self.odds_scope = OddsScope::Default;
-                        self.odds_region = 0;
-                        self.odds_new_member.clear();
-                        self.odds_open = true;
-                        self.dialog_open = false;
-                        self.clear_open = false;
-                        self.keywords_open = false;
-                        self.replacements_open = false;
-                    }
-                    ui.add_space(4.0);
-                    if top_button(ui, "开奖", 52.0)
-                        .on_hover_text("录入开奖号码，用于总账对奖")
-                        .clicked()
-                    {
-                        self.draw_inputs = draw_inputs_from(&self.draws);
-                        self.draw_paste = Default::default();
-                        self.draw_paste_error = Default::default();
-                        self.draw_error = None;
-                        self.draw_open = true;
-                    }
-                    ui.add_space(4.0);
-                    if top_button(ui, "总账", 52.0)
-                        .on_hover_text("出账单：按会员汇总投注金额、中奖、回水和输赢")
-                        .clicked()
-                    {
-                        self.page = Page::Ledger;
-                        self.dialog_open = false;
-                        self.clear_open = false;
-                        self.keywords_open = false;
-                        self.replacements_open = false;
-                    }
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     let ref_label = if self.references.is_empty() {
                         "引用列表".to_string()
                     } else {
@@ -3183,8 +3605,32 @@ impl ViewerApp {
                         self.keywords_open = false;
                         self.replacements_open = false;
                     }
-                    ui.add_space(4.0);
-                    if top_button(ui, "风险", 52.0)
+
+                    top_group_gap(ui);
+                    top_group_label(ui, "对奖", "录入开奖后查看总账与风险");
+                    if top_button(ui, "开奖", 48.0)
+                        .on_hover_text("录入开奖号码，用于总账对奖")
+                        .clicked()
+                    {
+                        self.draw_inputs = draw_inputs_from(&self.draws);
+                        self.draw_paste = Default::default();
+                        self.draw_paste_error = Default::default();
+                        self.draw_error = None;
+                        self.draw_open = true;
+                    }
+                    ui.add_space(2.0);
+                    if top_button(ui, "总账", 48.0)
+                        .on_hover_text("出账单：按会员汇总投注金额、中奖、回水和输赢")
+                        .clicked()
+                    {
+                        self.page = Page::Ledger;
+                        self.dialog_open = false;
+                        self.clear_open = false;
+                        self.keywords_open = false;
+                        self.replacements_open = false;
+                    }
+                    ui.add_space(2.0);
+                    if top_button(ui, "风险", 48.0)
                         .on_hover_text("按号码 / 组合查看整区风险敞口")
                         .clicked()
                     {
@@ -3194,8 +3640,45 @@ impl ViewerApp {
                         self.keywords_open = false;
                         self.replacements_open = false;
                     }
-                    ui.add_space(4.0);
-                    if top_button(ui, "信息码", 60.0)
+
+                    top_group_gap(ui);
+                    top_group_label(ui, "设置", "玩法关键词、替换词、赔率与信息码");
+                    if top_button(ui, "关键词", 56.0)
+                        .on_hover_text("玩法关键词 / 金额识别 / 区域 & 其他")
+                        .clicked()
+                    {
+                        self.keywords_open = true;
+                        self.dialog_open = false;
+                        self.clear_open = false;
+                        self.replacements_open = false;
+                    }
+                    ui.add_space(2.0);
+                    if top_button(ui, "替换词", 56.0)
+                        .on_hover_text("转换前把 A 词替换为 B 词")
+                        .clicked()
+                    {
+                        self.replacements_open = true;
+                        self.dialog_open = false;
+                        self.clear_open = false;
+                        self.keywords_open = false;
+                    }
+                    ui.add_space(2.0);
+                    if top_button(ui, "赔率", 48.0)
+                        .on_hover_text("设置默认 / 分组 / 会员的赔率与回水")
+                        .clicked()
+                    {
+                        self.odds_draft = self.odds.clone();
+                        self.odds_scope = OddsScope::Default;
+                        self.odds_region = 0;
+                        self.odds_new_member.clear();
+                        self.odds_open = true;
+                        self.dialog_open = false;
+                        self.clear_open = false;
+                        self.keywords_open = false;
+                        self.replacements_open = false;
+                    }
+                    ui.add_space(2.0);
+                    if top_button(ui, "信息码", 56.0)
                         .on_hover_text("录入分析师给的组合；注单踩中时会标黄提醒")
                         .clicked()
                     {
@@ -3212,28 +3695,12 @@ impl ViewerApp {
                             self.reference_open = false;
                         }
                     }
-                    ui.add_space(4.0);
-                    if top_button(ui, "授权", 52.0)
-                        .on_hover_text("查看当前账号、到期时间，修改密码或退出登录")
+                    ui.add_space(2.0);
+                    if top_button(ui, "权限", 48.0)
+                        .on_hover_text("查看当前账号、到期时间，修改密码 / 退出登录")
                         .clicked()
                     {
-                        self.auth_open = !self.auth_open;
-                        if self.auth_open {
-                            self.pwd_msg = None;
-                            self.pwd_old.clear();
-                            self.pwd_new.clear();
-                            self.pwd_confirm.clear();
-                            // 打开时后台刷新一次账号信息，免得显示旧的到期日。
-                            if self.auth_refresh_rx.is_none() {
-                                let auth = self.auth.clone();
-                                let (tx, rx) = channel();
-                                self.auth_refresh_rx = Some(rx);
-                                std::thread::spawn(move || {
-                                    auth.refresh();
-                                    let _ = tx.send(());
-                                });
-                            }
-                        }
+                        self.toggle_auth_dialog();
                     }
                 }
                 Page::Ledger => {
@@ -3329,20 +3796,12 @@ impl ViewerApp {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if top_button(ui, "⟳", 22.0)
-                    .on_hover_text("重新读取微信数据（会清空当前注单）")
-                    .clicked()
-                {
-                    self.refresh(ctx);
-                }
+                // 账号 / 剩余时间已改到窗口标题（版本号后面），顶栏只保留读取状态。
                 match &self.state {
-                    // 主页顶栏最右侧不再显示昵称 / 联系人数 / 群聊数，只保留刷新按钮。
                     State::Ready(_) => {}
                     State::Loading => {
-                        ui.add_space(10.0);
-                        ui.label(
-                            RichText::new(&self.status).size(11.0).color(TOOLBAR_SUB),
-                        );
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(self.status.as_str()).size(11.0).color(TOOLBAR_SUB));
                     }
                     State::Failed(_) => {
                         ui.add_space(10.0);
@@ -3426,33 +3885,50 @@ impl ViewerApp {
             .map(|g| g.name.clone())
     }
 
-    /// 某条注单在指定地区的赔率：会员覆盖 → 分组 → 默认。
+    /// 某条注单在指定地区的赔率：会员覆盖（来源身份 → 旧昵称）→ 分组 → 默认。
     fn odds_for_row(&self, row: &MsgRow, lottery: &str) -> &crate::odds::OddsSet {
         let group = self.group_with_odds_for(&row.chat, &row.sender);
-        self.odds
-            .resolve_lottery(&row.nick, group.as_deref(), lottery)
+        let identity = member_identity(&row.chat, &row.sender);
+        self.odds.resolve_member(
+            &identity,
+            &row.nick,
+            group.as_deref(),
+            crate::odds::region_index(lottery),
+        )
     }
 
     /// 详情面板正在展示的会员（注单详情优先，其次单条录入选中的会员）。
     fn detail_odds(&self, lottery: &str) -> &crate::odds::OddsSet {
-        let (member, group) = if let Some(row) = &self.selected_order_row {
-            (
-                row.nick.clone(),
-                self.group_with_odds_for(&row.chat, &row.sender),
-            )
-        } else if let Some(key) = &self.single_member {
-            let member = self
-                .single_members
-                .iter()
-                .find(|c| &c.key == key)
-                .map(|c| c.nick.clone())
-                .unwrap_or_default();
-            (member, self.group_with_odds_for_member(key))
-        } else {
-            (String::new(), None)
-        };
+        if let Some(row) = &self.selected_order_row {
+            let group = self.group_with_odds_for(&row.chat, &row.sender);
+            let identity = member_identity(&row.chat, &row.sender);
+            return self
+                .odds
+                .resolve_member(
+                    &identity,
+                    &row.nick,
+                    group.as_deref(),
+                    crate::odds::region_index(lottery),
+                );
+        }
+        if let Some(key) = &self.single_member {
+            if let Some(choice) = self.single_members.iter().find(|c| &c.key == key) {
+                let (chat, member) = match key {
+                    MemberKey::Contact(c) => (c.as_str(), c.as_str()),
+                    MemberKey::Member(chat, member) => (chat.as_str(), member.as_str()),
+                };
+                let identity = member_identity(chat, member);
+                let group = self.group_with_odds_for_member(key);
+                return self.odds.resolve_member(
+                    &identity,
+                    &choice.nick,
+                    group.as_deref(),
+                    crate::odds::region_index(lottery),
+                );
+            }
+        }
         self.odds
-            .resolve_lottery(&member, group.as_deref(), lottery)
+            .resolve_member("", "", None, crate::odds::region_index(lottery))
     }
 
     /// 总账（出账单）：按会员汇总投注，并用「开奖」录入的号码自动对奖，算出
@@ -4169,81 +4645,87 @@ impl ViewerApp {
             .inner_margin(Margin::symmetric(16, 8))
             .show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
+                // ── 固定顶部：标题 / 按钮 / 开奖号码，不随账单滚动 ──
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("出账单").size(20.0).strong().color(TEXT));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(&today).size(15.0).color(MUTED));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if styled_button(
+                            ui,
+                            RichText::new("对账")
+                                .size(13.0)
+                                .strong()
+                                .color(Color32::from_rgb(0x17, 0x32, 0x4D)),
+                            CARD,
+                            BTN_HOVER_BG,
+                            BTN_ACTIVE_BG,
+                            Stroke::new(1.0, BILL_LINE),
+                            Stroke::new(1.0, BTN_HOVER_BORDER),
+                            CornerRadius::same(10),
+                            Vec2::new(72.0, 30.0),
+                        )
+                        .on_hover_text("和对方发来的对账文本逐人、逐批比对")
+                        .clicked()
+                        {
+                            self.reconcile_msg = None;
+                            self.reconcile_open = true;
+                        }
+                        ui.add_space(8.0);
+                        if blue_button(
+                            ui,
+                            RichText::new("导出图片")
+                                .size(13.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                            true,
+                            CornerRadius::same(10),
+                            Vec2::new(96.0, 30.0),
+                        )
+                        .on_hover_text("按会员分别导出出账单图片到「图片」文件夹")
+                        .clicked()
+                        {
+                            self.bill_export_candidates = block_list
+                                .iter()
+                                .map(|b| b.name.clone())
+                                .collect();
+                            self.bill_export_selected = self
+                                .bill_export_candidates
+                                .iter()
+                                .cloned()
+                                .collect();
+                            self.bill_export_open = true;
+                        }
+                        ui.add_space(8.0);
+                        egui::Frame::new()
+                            .stroke(Stroke::new(
+                                1.0,
+                                Color32::from_rgb(0xC6, 0xCB, 0xD2),
+                            ))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::ZERO)
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if view_tab(ui, "分类", category_view) {
+                                    category_view = true;
+                                }
+                                if view_tab(ui, "列表", !category_view) {
+                                    category_view = false;
+                                }
+                            });
+                    });
+                });
+                self.ledger_category = category_view;
+                ui.add_space(4.0);
+                draw_summary_ui(ui, &self.draws, "开奖：");
+                ui.add_space(6.0);
+                hairline(ui);
+                ui.add_space(6.0);
+                // ── 账单内容：只有这里滚动 ──
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .id_salt("bill_scroll")
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("出账单").size(20.0).strong().color(TEXT));
-                            ui.add_space(10.0);
-                            ui.label(RichText::new(&today).size(15.0).color(MUTED));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if styled_button(
-                                    ui,
-                                    RichText::new("对账")
-                                        .size(13.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(0x17, 0x32, 0x4D)),
-                                    CARD,
-                                    BTN_HOVER_BG,
-                                    BTN_ACTIVE_BG,
-                                    Stroke::new(1.0, BILL_LINE),
-                                    Stroke::new(1.0, BTN_HOVER_BORDER),
-                                    CornerRadius::same(10),
-                                    Vec2::new(72.0, 30.0),
-                                )
-                                .on_hover_text("和对方发来的对账文本逐人、逐批比对")
-                                .clicked()
-                                {
-                                    self.reconcile_msg = None;
-                                    self.reconcile_open = true;
-                                }
-                                ui.add_space(8.0);
-                                if blue_button(
-                                    ui,
-                                    RichText::new("导出图片")
-                                        .size(13.0)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                    true,
-                                    CornerRadius::same(10),
-                                    Vec2::new(96.0, 30.0),
-                                )
-                                .on_hover_text("按会员分别导出出账单图片到「图片」文件夹")
-                                .clicked()
-                                {
-                                    self.bill_export_candidates = block_list
-                                        .iter()
-                                        .map(|b| b.name.clone())
-                                        .collect();
-                                    self.bill_export_selected = self
-                                        .bill_export_candidates
-                                        .iter()
-                                        .cloned()
-                                        .collect();
-                                    self.bill_export_open = true;
-                                }
-                                ui.add_space(8.0);
-                                egui::Frame::new()
-                                    .stroke(Stroke::new(
-                                        1.0,
-                                        Color32::from_rgb(0xC6, 0xCB, 0xD2),
-                                    ))
-                                    .corner_radius(CornerRadius::same(8))
-                                    .inner_margin(Margin::ZERO)
-                                    .show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.x = 0.0;
-                                        if view_tab(ui, "分类", category_view) {
-                                            category_view = true;
-                                        }
-                                        if view_tab(ui, "列表", !category_view) {
-                                            category_view = false;
-                                        }
-                                    });
-                            });
-                        });
-                        self.ledger_category = category_view;
-                        ui.add_space(6.0);
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!(
@@ -4255,7 +4737,6 @@ impl ViewerApp {
                             )
                             .wrap(),
                         );
-                        draw_summary_ui(ui, &self.draws, "开奖：");
                         if category_view {
                             ui.add(
                                 egui::Label::new(
@@ -4470,6 +4951,453 @@ impl ViewerApp {
             let rows = crate::xiaoma_offsets::apply_to_rows(base.clone(), &self.xm.store.offsets);
             let draw_sets = [0, 1, 2].map(|r| xiaoma_modals::draw_set(&self.draws, r));
             self.xm_modals(ui.ctx(), &rows, &draw_sets);
+        }
+        if self.code_report_open {
+            self.code_report_dialog(ui.ctx(), &bets, odds_group.as_deref());
+        }
+    }
+
+    /// 特码「吃码上报」：按号码把投注额减掉，写进减额表（风险页立即生效）。
+    fn code_report_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        bets: &[crate::risk::BetRow],
+        odds_group: Option<&str>,
+    ) {
+        let mut open = self.code_report_open;
+        let mut close = false;
+        let mut apply = false;
+        let mut copy_clicked = false;
+        let mut fill_suggested = false;
+
+        egui::Window::new("吃码上报")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([800.0, 580.0])
+            .min_width(640.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                window_header_cursor(ui);
+                ui.label(
+                    RichText::new(
+                        "一个号码一行：按当前特码风险 / 下注额算出要吃多少，确认后写进减额表；风险页立即生效，总账不受影响。",
+                    )
+                    .size(11.0)
+                    .color(SUB),
+                );
+                ui.add_space(6.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("地区").size(11.5).color(SUB));
+                    for r in 0..3 {
+                        if ui
+                            .selectable_label(
+                                self.code_report_region == r,
+                                RichText::new(crate::risk::REGION_NAMES[r]).size(12.0),
+                            )
+                            .clicked()
+                            && self.code_report_region != r
+                        {
+                            self.code_report_region = r;
+                            self.code_report_reduce.clear();
+                            self.code_report_msg = None;
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .selectable_label(
+                            self.code_report_mode == CodeReportMode::Risk,
+                            RichText::new("风险下限").size(12.0),
+                        )
+                        .clicked()
+                    {
+                        self.code_report_mode = CodeReportMode::Risk;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.code_report_mode == CodeReportMode::Amount,
+                            RichText::new("下注额上限").size(12.0),
+                        )
+                        .clicked()
+                    {
+                        self.code_report_mode = CodeReportMode::Amount;
+                    }
+                    match self.code_report_mode {
+                        CodeReportMode::Risk => {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.code_report_threshold)
+                                    .desired_width(90.0),
+                            );
+                        }
+                        CodeReportMode::Amount => {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.code_report_limit)
+                                    .desired_width(90.0),
+                            );
+                        }
+                    }
+                    if ui.add(tiny_button("一键建议", TEXT)).clicked() {
+                        fill_suggested = true;
+                    }
+                    if ui.add(tiny_button("复制格式", TEXT)).clicked() {
+                        copy_clicked = true;
+                    }
+                    if let Some(msg) = &self.code_report_msg {
+                        ui.label(RichText::new(msg).size(10.5).color(MUTED));
+                    }
+                });
+                ui.add_space(6.0);
+
+                let region = self.code_report_region.min(2);
+                let columns = self.special_panel_columns(bets, odds_group);
+                let col = &columns[region];
+                let set = self.odds.resolve("", odds_group, region);
+                let odds = set.value("special_number");
+                let rebate = set.value("rw_special_number");
+                let threshold = self
+                    .code_report_threshold
+                    .trim()
+                    .parse::<f64>()
+                    .unwrap_or(-10000.0);
+                let limit = self
+                    .code_report_limit
+                    .trim()
+                    .parse::<f64>()
+                    .unwrap_or(5000.0);
+                let denom = odds + rebate / 100.0 - 1.0;
+                let total = col.total_stake;
+
+                struct RowView {
+                    num: u32,
+                    stake: f64,
+                    risk: f64,
+                    need: f64,
+                }
+                let mut row_views: Vec<RowView> = col
+                    .rows
+                    .iter()
+                    .filter_map(|row| {
+                        let num = row.num?;
+                        let stake = row.stake;
+                        let risk = row.risk;
+                        let need = match self.code_report_mode {
+                            CodeReportMode::Risk => {
+                                if stake > 0.0 && risk < threshold && denom > 0.0 {
+                                    ((threshold - risk) / denom).ceil().min(stake)
+                                } else {
+                                    0.0
+                                }
+                            }
+                            CodeReportMode::Amount => {
+                                if stake > limit {
+                                    stake - limit
+                                } else {
+                                    0.0
+                                }
+                            }
+                        };
+                        Some(RowView {
+                            num,
+                            stake,
+                            risk,
+                            need,
+                        })
+                    })
+                    .collect();
+                if self.code_report_mode == CodeReportMode::Risk {
+                    row_views.sort_by(|a, b| {
+                        a.risk
+                            .partial_cmp(&b.risk)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.num.cmp(&b.num))
+                    });
+                } else {
+                    row_views.sort_by(|a, b| {
+                        b.stake
+                            .partial_cmp(&a.stake)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.num.cmp(&b.num))
+                    });
+                }
+
+                if fill_suggested {
+                    self.code_report_reduce.clear();
+                    for row in &row_views {
+                        if row.need > 0.0 {
+                            self.code_report_reduce
+                                .insert(row.num, crate::convert::fmt_amount(row.need));
+                        }
+                    }
+                    self.code_report_msg = Some("已填入建议额".to_string());
+                }
+
+                let mut reduce_now: Vec<(u32, f64)> = Vec::new();
+                for row in &row_views {
+                    let v = code_report_reduce_of(&self.code_report_reduce, row.num, row.stake);
+                    if v > 0.0 {
+                        reduce_now.push((row.num, v));
+                    }
+                }
+                let total_reduce: f64 = reduce_now.iter().map(|(_, v)| *v).sum();
+                let new_total = total - total_reduce;
+                let new_base = new_total - new_total * rebate / 100.0;
+                let report_text = code_report_text(region, &reduce_now);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "总金额 {}",
+                            crate::convert::fmt_amount(total)
+                        ))
+                        .size(12.0)
+                        .strong()
+                        .color(TEXT),
+                    );
+                    if total_reduce > 0.0 {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "吃码后 {}",
+                                crate::convert::fmt_amount(new_total)
+                            ))
+                            .size(11.5)
+                            .color(GREEN_DEEP),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+
+                if copy_clicked && !report_text.is_empty() {
+                    ui.ctx().copy_text(report_text.clone());
+                    self.code_report_msg = Some("已复制".to_string());
+                }
+                if !report_text.is_empty() {
+                    egui::Frame::new()
+                        .fill(STRIPE)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&report_text)
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(TEXT),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.add_space(6.0);
+                }
+
+                let table_h = (ui.available_height() - 76.0).max(180.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .id_salt("code_report_scroll")
+                    .max_height(table_h)
+                    .show(ui, |ui| {
+                        egui::Grid::new("code_report_grid")
+                            .num_columns(6)
+                            .spacing([12.0, 2.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for h in [
+                                    "号码",
+                                    "生肖",
+                                    "下注额",
+                                    if self.code_report_mode == CodeReportMode::Risk {
+                                        "风险"
+                                    } else {
+                                        "超出"
+                                    },
+                                    "吃码金额",
+                                    "吃码后风险",
+                                ] {
+                                    ui.label(RichText::new(h).size(11.0).strong().color(SUB));
+                                }
+                                ui.end_row();
+                                for row in &row_views {
+                                    ui.label(
+                                        RichText::new(format!("{:02}", row.num))
+                                            .size(12.0)
+                                            .color(TEXT),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            crate::settle::zodiac_of(row.num).unwrap_or(""),
+                                        )
+                                        .size(12.0)
+                                        .color(SUB),
+                                    );
+                                    ui.with_layout(
+                                        Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(if row.stake == 0.0 {
+                                                    "-".to_string()
+                                                } else {
+                                                    crate::convert::fmt_amount(row.stake)
+                                                })
+                                                .size(12.0)
+                                                .color(if row.stake == 0.0 {
+                                                    MUTED
+                                                } else {
+                                                    TEXT
+                                                }),
+                                            );
+                                        },
+                                    );
+                                    let (metric, danger) =
+                                        if self.code_report_mode == CodeReportMode::Risk {
+                                            (
+                                                if row.stake == 0.0 {
+                                                    "-".to_string()
+                                                } else {
+                                                    crate::convert::fmt_amount(row.risk)
+                                                },
+                                                row.stake > 0.0 && row.risk < threshold,
+                                            )
+                                        } else {
+                                            let over = (row.stake - limit).max(0.0);
+                                            (
+                                                if over > 0.0 {
+                                                    crate::convert::fmt_amount(over)
+                                                } else {
+                                                    "-".to_string()
+                                                },
+                                                over > 0.0,
+                                            )
+                                        };
+                                    ui.with_layout(
+                                        Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(metric)
+                                                    .size(12.0)
+                                                    .color(if danger { MONEY_RED } else { TEXT }),
+                                            );
+                                        },
+                                    );
+                                    let entry =
+                                        self.code_report_reduce.entry(row.num).or_default();
+                                    let hint = if row.need > 0.0 {
+                                        crate::convert::fmt_amount(row.need)
+                                    } else {
+                                        String::new()
+                                    };
+                                    ui.add(
+                                        egui::TextEdit::singleline(entry)
+                                            .desired_width(64.0)
+                                            .align(Align2::RIGHT_CENTER)
+                                            .hint_text(hint),
+                                    );
+                                    let reduce = code_report_reduce_of(
+                                        &self.code_report_reduce,
+                                        row.num,
+                                        row.stake,
+                                    );
+                                    if reduce > 0.0 {
+                                        let after =
+                                            new_base - (row.stake - reduce) * odds;
+                                        ui.label(
+                                            RichText::new(crate::convert::fmt_amount(after))
+                                                .size(12.0)
+                                                .color(if after >= threshold {
+                                                    MONEY_GREEN
+                                                } else {
+                                                    MONEY_RED
+                                                }),
+                                        );
+                                    } else {
+                                        ui.label(RichText::new("-").size(12.0).color(MUTED));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "按 {} 倍 / 回水 {}% 算",
+                            crate::convert::fmt_amount(odds),
+                            crate::convert::fmt_amount(rebate)
+                        ))
+                        .size(10.5)
+                        .color(SUB),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut final_reduce: Vec<(u32, f64)> = Vec::new();
+                        for row in &row_views {
+                            let v = code_report_reduce_of(
+                                &self.code_report_reduce,
+                                row.num,
+                                row.stake,
+                            );
+                            if v > 0.0 {
+                                final_reduce.push((row.num, v));
+                            }
+                        }
+                        let enabled = !final_reduce.is_empty();
+                        if primary_button(
+                            ui,
+                            RichText::new("确认上报")
+                                .size(12.5)
+                                .color(if enabled { Color32::WHITE } else { SUB }),
+                            enabled,
+                            CornerRadius::same(6),
+                            Vec2::new(96.0, 28.0),
+                        )
+                        .clicked()
+                        {
+                            apply = true;
+                        }
+                        if ui.add(tiny_button("取消", SUB)).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if apply {
+            let region = self.code_report_region.min(2);
+            let columns = self.special_panel_columns(bets, odds_group);
+            let col = &columns[region];
+            let mut reduce_now: Vec<(u32, f64)> = Vec::new();
+            let mut delta: BTreeMap<String, f64> = BTreeMap::new();
+            for row in &col.rows {
+                let Some(num) = row.num else {
+                    continue;
+                };
+                let v = code_report_reduce_of(&self.code_report_reduce, num, row.stake);
+                if v > 0.0 {
+                    reduce_now.push((num, v));
+                    delta.insert(
+                        crate::xiaoma_offsets::row_key(region, "特码", &format!("{num:02}")),
+                        v,
+                    );
+                }
+            }
+            if !delta.is_empty() {
+                let detail = code_report_detail(&reduce_now);
+                let desc = format!(
+                    "{} {}：{}",
+                    crate::risk::REGION_NAMES[region],
+                    "特码",
+                    detail.replace('\n', "；")
+                );
+                self.xm.store.apply(delta, "吃码上报", desc);
+                self.code_report_reduce.clear();
+                self.code_report_msg = None;
+                close = true;
+            }
+        }
+        if close || !open {
+            self.code_report_open = false;
         }
     }
 
@@ -4697,6 +5625,48 @@ impl ViewerApp {
     }
 
     /// 四个投注页签（特码 / 连肖 / 平特 / 平码）共用的三栏表。
+    /// 当前减额表里属于「特码」的吃码金额（按地区拆开，号码 → 减额）。
+    fn special_offsets_by_region(&self) -> [BTreeMap<u32, f64>; 3] {
+        let mut out: [BTreeMap<u32, f64>; 3] = Default::default();
+        for (key, amount) in &self.xm.store.offsets {
+            let mut parts = key.splitn(3, '|');
+            let Some(region) = parts.next().and_then(|s| s.parse::<usize>().ok()) else {
+                continue;
+            };
+            if region >= 3 || parts.next() != Some("特码") {
+                continue;
+            }
+            let Some(combo) = parts.next() else {
+                continue;
+            };
+            if let Ok(num) = combo.parse::<u32>() {
+                out[region].insert(num, *amount);
+            }
+        }
+        out
+    }
+
+    /// 特码三栏（已应用吃码减额）。
+    fn special_panel_columns(
+        &self,
+        bets: &[crate::risk::BetRow],
+        odds_group: Option<&str>,
+    ) -> Vec<crate::risk::PanelColumn> {
+        let mut columns = crate::risk::panel(
+            crate::risk::PanelList::Special,
+            bets,
+            &self.draws,
+            &self.odds,
+            odds_group,
+            self.risk_lian_size,
+        );
+        let offsets = self.special_offsets_by_region();
+        for (r, col) in columns.iter_mut().enumerate() {
+            crate::risk::apply_special_offsets(col, r, &offsets[r], &self.odds, odds_group);
+        }
+        columns
+    }
+
     fn risk_bet_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -4704,6 +5674,34 @@ impl ViewerApp {
         bets: &[crate::risk::BetRow],
         odds_group: Option<&str>,
     ) {
+        if list == crate::risk::PanelList::Special {
+            ui.horizontal(|ui| {
+                if secondary_small_button(ui, "吃码上报")
+                    .on_hover_text("按号码吃码，直接反映到下面的特码金额 / 风险（只影响风险页）")
+                    .clicked()
+                {
+                    self.code_report_open = true;
+                    self.code_report_reduce.clear();
+                    self.code_report_msg = None;
+                }
+                if ui
+                    .add(tiny_button("减额记录", SUB))
+                    .on_hover_text("查看 / 撤回吃码记录（与小码减额共用一张表）")
+                    .clicked()
+                {
+                    self.xm.log_open = true;
+                }
+                let count: usize = self.special_offsets_by_region().iter().map(|m| m.len()).sum();
+                if count > 0 {
+                    ui.label(
+                        RichText::new(format!("已吃码 {count} 个号"))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
+            });
+            ui.add_space(6.0);
+        }
         if list == crate::risk::PanelList::LianXiao {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("规格").size(12.0).color(MUTED));
@@ -4728,14 +5726,18 @@ impl ViewerApp {
             ui.add_space(8.0);
         }
 
-        let columns = crate::risk::panel(
-            list,
-            bets,
-            &self.draws,
-            &self.odds,
-            odds_group,
-            self.risk_lian_size,
-        );
+        let columns = if list == crate::risk::PanelList::Special {
+            self.special_panel_columns(bets, odds_group)
+        } else {
+            crate::risk::panel(
+                list,
+                bets,
+                &self.draws,
+                &self.odds,
+                odds_group,
+                self.risk_lian_size,
+            )
+        };
         let with_risk = list == crate::risk::PanelList::Special;
 
         struct ColView {
@@ -5474,26 +6476,19 @@ impl ViewerApp {
                             let label = truncate_display(&name_of(key), 4);
                             let selected = self.member_focus.as_ref() == Some(key);
                             if rail_item(ui, &label, selected) {
-                                if selected && self.selected_order_row.is_some() {
-                                    // 已选中成员但正在看注单详情：回到该成员的注单消息。
-                                    self.selected_order_row = None;
-                                    self.selected_order_key = None;
-                                    self.converted = None;
-                                    self.edit_text.clear();
-                                } else if selected {
-                                    // 再点一次：取消成员筛选，注单列表恢复全部。
-                                    self.member_focus = None;
-                                    self.selected_order_row = None;
-                                    self.selected_order_key = None;
-                                    self.converted = None;
-                                    self.edit_text.clear();
+                                // 点成员只筛左侧注单；右侧面板不再显示整段成员消息。
+                                // 再点一次同一个成员 = 取消筛选。
+                                self.member_focus = if selected {
+                                    None
                                 } else {
-                                    self.member_focus = Some(key.clone());
-                                    self.selected_order_row = None;
-                                    self.selected_order_key = None;
-                                    self.converted = None;
-                                    self.edit_text.clear();
-                                }
+                                    Some(key.clone())
+                                };
+                                self.selected_order_row = None;
+                                self.selected_order_key = None;
+                                self.converted = None;
+                                self.edit_text.clear();
+                                self.edit_time.clear();
+                                self.ocr_msg = None;
                             }
                         }
                         if keys.is_empty() {
@@ -5535,7 +6530,10 @@ impl ViewerApp {
                     let body_h = ui.available_height();
                     // 明细列始终占满「原文」右侧的整块宽度：存疑原因改成明细上方
                     // 的横幅（见下），不再挤占表格的宽度。
-                    let left_w = 220.0;
+                    // 原文列要放得下「识别图片 / 删除 / 取消存疑 / 提交」整排按钮，
+                    // 太窄时 right_to_left 会往左溢出、盖住左边的注单消息面板；
+                    // 宁可牺牲一点明细宽度（最小窗口已在 main.rs 相应调大）。
+                    let left_w = 260.0;
                     let mid_w = (total_w - left_w - 3.0).max(160.0);
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -5549,6 +6547,15 @@ impl ViewerApp {
                                 let mut time_changed = false;
                                 ui.horizontal(|ui| {
                                     section_label(ui, "原文");
+                                    // 注数放在标题旁边，把整行宽度留给下面的操作按钮。
+                                    if let Some(out) = &self.converted {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(format!("{} 注", out.bets.len()))
+                                                .size(10.5)
+                                                .color(SUB),
+                                        );
+                                    }
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         ui.add_space(3.0);
                                         let resp = ui
@@ -5570,15 +6577,48 @@ impl ViewerApp {
                                     self.save_order_time();
                                 }
                                 ui.horizontal(|ui| {
-                                    if let Some(out) = &self.converted {
-                                        ui.label(
-                                            RichText::new(format!("{} 注", out.bets.len()))
-                                                .size(10.5)
-                                                .color(SUB),
-                                        );
-                                    }
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         ui.add_space(3.0);
+                                        // 「识别图片」在删除按钮右边：识别剪贴板截图，
+                                        // 把文字填进下面的原文编辑框。
+                                        if self.ocr_rx.is_some() {
+                                            styled_button_enabled(
+                                                ui,
+                                                RichText::new("识别中…").size(10.5).color(MUTED),
+                                                false,
+                                                BLUE_BG,
+                                                BLUE_HOVER,
+                                                Color32::from_rgb(0xC6, 0xDB, 0xF5),
+                                                Stroke::new(1.0, BLUE_FG),
+                                                Stroke::new(1.0, BLUE_FG),
+                                                CornerRadius::same(5),
+                                                Vec2::new(56.0, 22.0),
+                                            );
+                                        } else if styled_button(
+                                            ui,
+                                            RichText::new("识别图片").size(10.5).color(BLUE_FG),
+                                            BLUE_BG,
+                                            BLUE_HOVER,
+                                            Color32::from_rgb(0xC6, 0xDB, 0xF5),
+                                            Stroke::new(1.0, BLUE_FG),
+                                            Stroke::new(1.0, BLUE_FG),
+                                            CornerRadius::same(5),
+                                            Vec2::new(56.0, 22.0),
+                                        )
+                                        .on_hover_text("识别剪贴板里的截图，把文字填入原文")
+                                        .clicked()
+                                        {
+                                            let (tx, rx) = channel();
+                                            self.ocr_rx = Some(rx);
+                                            self.ocr_target = self.selected_order_key.clone();
+                                            self.ocr_msg = None;
+                                            ui.ctx()
+                                                .request_repaint_after(Duration::from_millis(100));
+                                            std::thread::spawn(move || {
+                                                let _ = tx.send(crate::ocr::recognize_clipboard());
+                                            });
+                                        }
+                                        ui.add_space(4.0);
                                         if styled_button(
                                             ui,
                                             RichText::new("删除").size(10.5).color(RED),
@@ -5645,6 +6685,15 @@ impl ViewerApp {
                                         }
                                     });
                                 });
+                                if let Some((msg, err)) = &self.ocr_msg {
+                                    let color = if *err { RED } else { MONEY_GREEN };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(msg).size(10.0).color(color),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
                                 ui.add_space(4.0);
                                 let original_box = egui::Frame::new()
                                     .fill(STRIPE)
@@ -6076,72 +7125,11 @@ impl ViewerApp {
                             },
                         );
                     });
-                } else if let Some(key) = &self.member_focus {
-                    let mut rows: Vec<&MsgRow> = self
-                        .orders
-                        .iter()
-                        .filter(|r| key.matches_row(r))
-                        .collect();
-                    if let Some(name) = &self.order_filter {
-                        if let Some(g) = self.groups.iter().find(|g| &g.name == name) {
-                            rows.retain(|r| g.matches(r));
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("成员消息").size(12.5).strong().color(TEXT));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            count_pill(ui, rows.len());
-                        });
-                    });
-                    ui.add_space(4.0);
-                    hairline(ui);
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .id_salt("member_msg_scroll")
-                        .show(ui, |ui| {
-                            if rows.is_empty() {
-                                ui.add_space(24.0);
-                                ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        RichText::new("该成员当前没有注单消息")
-                                            .size(12.0)
-                                            .color(SUB),
-                                    );
-                                });
-                            } else {
-                                for (i, r) in rows.iter().enumerate() {
-                                    if i > 0 {
-                                        hairline(ui);
-                                    }
-                                    ui.add_space(9.0);
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(&r.time)
-                                                .size(10.5)
-                                                .monospace()
-                                                .color(SUB),
-                                        );
-                                        ui.add_space(10.0);
-                                        ui.label(RichText::new(&r.kind).size(10.5).color(SUB));
-                                    });
-                                    ui.add_space(3.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&r.content).size(13.0).color(TEXT),
-                                        )
-                                        .wrap()
-                                        .selectable(true),
-                                    );
-                                    ui.add_space(9.0);
-                                }
-                            }
-                        });
                 } else {
                     empty_detail(
                         ui,
                         "未选择注单",
-                        "点击左侧成员查看其全部消息，或点击一条注单查看原文与明细。",
+                        "点击一条注单查看原文与明细；点左侧成员可筛选该成员的注单。",
                     );
                 }
             });
@@ -6149,10 +7137,28 @@ impl ViewerApp {
 
     fn orders_panel(&mut self, ui: &mut egui::Ui, data: &AppData) {
         let group_names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
+        // 已撤回页签只显示当前时段内的记录，计数也按这个范围算。
+        let revoked_count = self.revoked_in_range().len();
+        // 标题行右侧的紧凑时段：`11-26 17:00–21:30`，完整说明放悬停。
+        let range_short = format!(
+            "{}月{}日 {}–{}",
+            self.import_date.month(),
+            self.import_date.day(),
+            self.import_start.format("%H:%M"),
+            self.import_end.format("%H:%M"),
+        );
+        let range_tip = format!(
+            "当前只显示 {}年{}月{}日 {}–{} 的消息（含引用 / 已撤回）",
+            self.import_date.year(),
+            self.import_date.month(),
+            self.import_date.day(),
+            self.import_start.format("%H:%M"),
+            self.import_end.format("%H:%M"),
+        );
         egui::Frame::new()
             .fill(CARD)
             // 注单消息面板左右留白固定 2px。
-            .inner_margin(Margin::symmetric(2, 6))
+            .inner_margin(Margin::symmetric(2, 4))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.set_min_height(ui.available_height());
@@ -6176,15 +7182,39 @@ impl ViewerApp {
                         self.refresh_single_members(data);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let count = if visible.len() == self.orders.len() {
-                            format!("{} 条", visible.len())
-                        } else {
-                            format!("{} / {} 条", visible.len(), self.orders.len())
-                        };
-                        ui.label(RichText::new(count).size(11.0).color(SUB));
+                        ui.label(RichText::new(&range_short).size(9.5).color(SUB))
+                            .on_hover_text(range_tip);
                     });
                 });
-                ui.add_space(4.0);
+                // 三个页签：未撤回 / 引用 / 已撤回。
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let tabs = [
+                        (OrderTab::Active, format!("未撤回 {}", self.orders.len())),
+                        (OrderTab::References, format!("引用 {}", self.references.len())),
+                        (OrderTab::Revoked, format!("已撤回 {revoked_count}")),
+                    ];
+                    for (tab, label) in tabs {
+                        if order_tab_button(ui, &label, self.order_tab == tab).clicked() {
+                            self.order_tab = tab;
+                        }
+                    }
+                });
+                // 未撤回以外的页签：分隔线后直接是列表。
+                ui.add_space(3.0);
+                if self.order_tab != OrderTab::Active {
+                    hairline(ui);
+                    ui.add_space(3.0);
+                    if self.order_tab == OrderTab::References {
+                        self.reference_tab_ui(ui);
+                    } else {
+                        self.revoked_tab_ui(ui);
+                    }
+                    return;
+                }
+                // 未撤回：分组过滤 + 上/下一条，合并成列表上方的一行。
+                ui.add_space(2.0);
 
                 let mut nav: Option<isize> = None;
                 ui.horizontal_wrapped(|ui| {
@@ -6223,13 +7253,22 @@ impl ViewerApp {
                     {
                         nav = Some(1);
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let count = if visible.len() == self.orders.len() {
+                            visible.len().to_string()
+                        } else {
+                            format!("{}/{}", visible.len(), self.orders.len())
+                        };
+                        ui.label(RichText::new(count).size(10.0).color(SUB));
+                    });
                 });
                 if let Some(dir) = nav {
                     let visible = self.visible_order_indices();
                     self.select_adjacent_order(&visible, dir);
                 }
-                ui.add_space(4.0);
+                ui.add_space(3.0);
                 hairline(ui);
+                ui.add_space(2.0);
 
                 match &self.orders_state {
                     OrdersState::Idle => {
@@ -6340,6 +7379,7 @@ impl ViewerApp {
                                             self.converted = Some(conv);
                                             self.edit_text = row.content.clone();
                                             self.edit_time = row.time.clone();
+                                            self.ocr_msg = None;
                                         }
                                     }
                                 });
@@ -6348,6 +7388,155 @@ impl ViewerApp {
                             }
                         }
                     }
+                }
+            });
+    }
+
+    /// 「引用」页签：在注单面板里直接查看引用消息。
+    fn reference_tab_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let reserve = if self.reference_search.is_empty() { 0.0 } else { 40.0 };
+            let width = (ui.available_width() - reserve).max(80.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.reference_search)
+                    .font(FontId::proportional(11.0))
+                    .margin(Margin::symmetric(4, 1))
+                    .hint_text(RichText::new("搜索引用 / 被引用 / 发送人").size(9.0))
+                    .desired_width(width),
+            );
+            if !self.reference_search.is_empty()
+                && ui
+                    .add(tiny_button("×", SUB))
+                    .on_hover_text("清除搜索")
+                    .clicked()
+            {
+                self.reference_search.clear();
+            }
+        });
+        if let Some(msg) = &self.reference_msg {
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(msg)
+                        .size(10.0)
+                        .color(if self.reference_msg_error { RED } else { MUTED }),
+                )
+                .wrap(),
+            );
+        }
+        ui.add_space(4.0);
+
+        let query = self.reference_search.trim().to_lowercase();
+        let rows: Vec<MsgRow> = self
+            .references
+            .iter()
+            .rev()
+            .filter(|r| {
+                query.is_empty()
+                    || r.content.to_lowercase().contains(&query)
+                    || r.nick.to_lowercase().contains(&query)
+                    || r.quote.as_ref().is_some_and(|q| {
+                        q.content.to_lowercase().contains(&query)
+                            || q.from.to_lowercase().contains(&query)
+                    })
+            })
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            empty_state(
+                ui,
+                if self.references.is_empty() {
+                    "暂无引用消息"
+                } else {
+                    "没有匹配的引用"
+                },
+            );
+            return;
+        }
+
+        let mut locate: Option<MsgRow> = None;
+        let mut delete: Option<MsgRow> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .id_salt("reference_tab_scroll")
+            .show(ui, |ui| {
+                for row in &rows {
+                    let action = reference_card(ui, row);
+                    if action.locate {
+                        locate = Some(row.clone());
+                    }
+                    if action.delete {
+                        delete = Some(row.clone());
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        if let Some(row) = delete {
+            if self.delete_quoted_message(&row, ui.ctx()) {
+                self.remove_reference(&row);
+            }
+        }
+        if let Some(row) = locate {
+            // 定位成功时 select_order_index 会切回「未撤回」；失败时留在本页签
+            // 才能看到「正在读取 / 找不到」的提示。
+            self.locate_quoted_message(&row, ui.ctx());
+        }
+    }
+
+    /// 「已撤回」页签：本地持久化的已撤回消息。
+    fn revoked_tab_ui(&mut self, ui: &mut egui::Ui) {
+        let mut rows = self.revoked_in_range();
+        if rows.is_empty() {
+            empty_state(ui, "当前时段暂无已撤回消息");
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("对方撤回消息后会自动记录在这里，重新导入也不会再出现。")
+                        .size(10.5)
+                        .color(SUB),
+                );
+            });
+            return;
+        }
+        rows.sort_by_key(|r| std::cmp::Reverse(r.sort));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .id_salt("revoked_tab_scroll")
+            .show(ui, |ui| {
+                for r in rows {
+                    egui::Frame::new()
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&r.time).size(10.5).color(SUB));
+                                if !r.nick.is_empty() {
+                                    ui.label(
+                                        RichText::new(&r.nick)
+                                            .size(11.5)
+                                            .strong()
+                                            .color(TEXT),
+                                    );
+                                }
+                                ui.with_layout(
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("已撤回")
+                                                .size(10.0)
+                                                .strong()
+                                                .color(RED)
+                                                .background_color(RED_BG),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(&r.content).size(12.0).color(TEXT));
+                        });
+                    ui.add_space(6.0);
                 }
             });
     }
@@ -6403,6 +7592,7 @@ impl ViewerApp {
         self.scroll_to_order = true;
         self.converted = Some(conv);
         self.edit_text = row.content;
+        self.ocr_msg = None;
     }
 
     // ---------------- 选定会员页 ----------------
@@ -6465,10 +7655,15 @@ impl ViewerApp {
             });
         });
         ui.add_space(4.0);
-        ui.label(
-            RichText::new("提示：点击整行即可选择；群聊点击左侧箭头展开。若同时勾选群聊和成员，以成员选择为准；勾选后可「＋ 新建分组」")
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "提示：点击整行即可选择；群聊点击左侧箭头展开。右键联系人 / 群成员可快速加入分组，右键群聊可全选成员。若同时勾选群聊和成员，以成员选择为准；勾选后可「＋ 新建分组」",
+                )
                 .size(11.0)
                 .color(SUB),
+            )
+            .wrap(),
         );
         self.tab = new_tab;
     }
@@ -6482,6 +7677,7 @@ impl ViewerApp {
         let mut delete: Option<usize> = None;
         let mut apply: Option<usize> = None;
         let mut overwrite: Option<usize> = None;
+        let mut append: Option<usize> = None;
         let mut manage: Option<String> = None;
         let mut rename: Option<String> = None;
 
@@ -6551,8 +7747,17 @@ impl ViewerApp {
                                         manage = Some(g.name.clone());
                                     }
                                     if ui
-                                        .add_enabled(has_sel, tiny_button("加入当前分组", GREEN))
+                                        .add_enabled(has_sel, tiny_button("追加本组", GREEN))
                                         .on_disabled_hover_text("先勾选联系人 / 群成员（整群选择不会加入分组）")
+                                        .on_hover_text("把当前勾选追加进本组，原有成员保留")
+                                        .clicked()
+                                    {
+                                        append = Some(i);
+                                    }
+                                    if ui
+                                        .add_enabled(has_sel, tiny_button("覆盖本组", TEXT))
+                                        .on_disabled_hover_text("先勾选联系人 / 群成员（整群选择不会加入分组）")
+                                        .on_hover_text("用当前勾选替换本组全部成员")
                                         .clicked()
                                     {
                                         overwrite = Some(i);
@@ -6577,6 +7782,14 @@ impl ViewerApp {
             self.groups[i].replace_selection(&self.selected_contacts, &self.selected_members);
             groups::save(&self.groups);
             // 分组内容变化会改变导入 / 监控来源。
+            self.selection_dirty = true;
+        }
+        if let Some(i) = append {
+            let contacts = self.selected_contacts.clone();
+            let members = self.selected_members.clone();
+            self.groups[i].contacts.extend(contacts);
+            self.groups[i].members.extend(members);
+            groups::save(&self.groups);
             self.selection_dirty = true;
         }
         if let Some(i) = apply {
@@ -7072,6 +8285,7 @@ impl ViewerApp {
             .map(|(a, b)| (a.clone(), b.clone()))
             .collect();
         let mut changed = false;
+        let mut reset = false;
 
         egui::Window::new("关键词")
             .collapsible(false)
@@ -7088,6 +8302,15 @@ impl ViewerApp {
                         }
                         ui.add_space(6.0);
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(tiny_button("恢复默认", SUB))
+                            .on_hover_text("把关键词恢复为内置默认配置，并覆盖本机当前设置")
+                            .clicked()
+                        {
+                            reset = true;
+                        }
+                    });
                 });
                 ui.add_space(6.0);
                 hairline(ui);
@@ -7277,16 +8500,26 @@ impl ViewerApp {
                     });
             });
 
-        for (f, s) in buffers {
-            self.keyword_inputs.insert(f, s);
-        }
-        if changed {
-            for (f, v) in all_items {
-                self.keywords.set(f, v);
-            }
+        if reset {
+            // 恢复为编译进 exe 的默认关键词，并覆盖本机保存的配置。
+            self.keywords = KeywordSettings::default();
+            self.keyword_inputs.clear();
+            self.keyword_variant.clear();
+            self.keyword_correct.clear();
             keywords::save(&self.keywords);
-            // 关键词变了，之前的自动转换结果（含存疑状态）全部失效：重算所有注单。
             self.recompute_all_conversions();
+        } else {
+            for (f, s) in buffers {
+                self.keyword_inputs.insert(f, s);
+            }
+            if changed {
+                for (f, v) in all_items {
+                    self.keywords.set(f, v);
+                }
+                keywords::save(&self.keywords);
+                // 关键词变了，之前的自动转换结果（含存疑状态）全部失效：重算所有注单。
+                self.recompute_all_conversions();
+            }
         }
         self.keyword_section = section;
         if !open {
@@ -7301,6 +8534,7 @@ impl ViewerApp {
         }
         let mut open = true;
         let mut changed = false;
+        let mut reset = false;
         let mut remove: Option<usize> = None;
         let mut add = false;
 
@@ -7387,40 +8621,60 @@ impl ViewerApp {
                     );
                 }
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new("替换只影响转换识别，不会修改原文。")
-                        .size(10.5)
-                        .color(SUB),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("替换只影响转换识别，不会修改原文。")
+                            .size(10.5)
+                            .color(SUB),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(tiny_button("恢复默认", SUB))
+                            .on_hover_text("恢复为内置默认替换词，并覆盖本机当前设置")
+                            .clicked()
+                        {
+                            reset = true;
+                        }
+                    });
+                });
             });
 
-        if let Some(i) = remove {
-            if i < self.replacements.len() {
-                self.replacements.remove(i);
-                changed = true;
-            }
-        }
-        if add {
-            let from = self.replacement_from.trim().to_string();
-            let to = self.replacement_to.trim().to_string();
-            if !from.is_empty() && !to.is_empty() {
-                if let Some(existing) = self
-                    .replacements
-                    .iter_mut()
-                    .find(|(a, _)| a == &from)
-                {
-                    existing.1 = to;
-                } else {
-                    self.replacements.push((from, to));
-                }
-                self.replacement_from.clear();
-                self.replacement_to.clear();
-                changed = true;
-            }
-        }
-        if changed {
+        if reset {
+            // 恢复为编译进 exe 的默认替换词，并覆盖本机保存的规则。
+            self.replacements = replacements::default_rules();
+            self.replacement_from.clear();
+            self.replacement_to.clear();
             replacements::save(&self.replacements);
             self.recompute_all_conversions();
+        } else {
+            if let Some(i) = remove {
+                if i < self.replacements.len() {
+                    self.replacements.remove(i);
+                    changed = true;
+                }
+            }
+            if add {
+                let from = self.replacement_from.trim().to_string();
+                let to = self.replacement_to.trim().to_string();
+                if !from.is_empty() && !to.is_empty() {
+                    if let Some(existing) = self
+                        .replacements
+                        .iter_mut()
+                        .find(|(a, _)| a == &from)
+                    {
+                        existing.1 = to;
+                    } else {
+                        self.replacements.push((from, to));
+                    }
+                    self.replacement_from.clear();
+                    self.replacement_to.clear();
+                    changed = true;
+                }
+            }
+            if changed {
+                replacements::save(&self.replacements);
+                self.recompute_all_conversions();
+            }
         }
         if !open {
             self.replacements_open = false;
@@ -7451,21 +8705,48 @@ impl ViewerApp {
             return;
         }
         let group_names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
-        let member_names: Vec<String> = self.odds_draft.members.keys().cloned().collect();
-        let mut candidates: Vec<String> = self
-            .orders
-            .iter()
-            .map(|r| r.nick.clone())
-            .filter(|n| !n.is_empty())
-            .collect();
-        candidates.sort();
-        candidates.dedup();
-        candidates.retain(|n| !self.odds_draft.members.contains_key(n));
+        // 会员覆盖的显示名：新键按「来源身份」显示成「昵称（群名 / 联系人）」，
+        // 旧版按昵称保存的键原样显示。先算好，窗口闭包里不再借 self.state。
+        let (member_names, member_labels, candidates) = {
+            let data = match &self.state {
+                State::Ready(d) => Some(&**d),
+                _ => None,
+            };
+            let mut labels: HashMap<String, String> = HashMap::new();
+            let mut names: Vec<String> = self.odds_draft.members.keys().cloned().collect();
+            for key in &names {
+                labels.insert(key.clone(), member_key_label(key, data));
+            }
+            names.sort_by(|a, b| {
+                labels
+                    .get(a)
+                    .cmp(&labels.get(b))
+                    .then_with(|| a.cmp(b))
+            });
+            // 从注单里列会员：按「会话 + 发送人」区分来源，同名但不同群 / 会话
+            // 的会员会各出一条，标签里带上来源。
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut candidates: Vec<(String, String, Option<String>)> = Vec::new();
+            for r in &self.orders {
+                if r.nick.is_empty() {
+                    continue;
+                }
+                let key = member_identity(&r.chat, &r.sender);
+                if !seen.insert(key.clone()) || self.odds_draft.members.contains_key(&key) {
+                    continue;
+                }
+                let label = identity_label(&r.chat, &r.sender, &r.nick, data);
+                let group = self.group_with_odds_for(&r.chat, &r.sender);
+                candidates.push((key, label, group));
+            }
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            (names, labels, candidates)
+        };
 
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
-        let mut add_member: Option<String> = None;
+        let mut add_member: Option<(String, Option<String>)> = None;
         let mut delete_member = false;
         let mut reset_region = false;
         let mut copy_macau = false;
@@ -7492,7 +8773,10 @@ impl ViewerApp {
                     let scope_text = match &self.odds_scope {
                         OddsScope::Default => "默认（未匹配分组 / 会员）".to_string(),
                         OddsScope::Group(name) => format!("分组：{name}"),
-                        OddsScope::Member(name) => format!("会员：{name}"),
+                        OddsScope::Member(key) => format!(
+                            "会员：{}",
+                            member_labels.get(key).cloned().unwrap_or_else(|| key.clone())
+                        ),
                     };
                     egui::ComboBox::from_id_salt("odds_scope")
                         .width(240.0)
@@ -7510,11 +8794,15 @@ impl ViewerApp {
                                     format!("分组：{name}"),
                                 );
                             }
-                            for name in &member_names {
+                            for key in &member_names {
+                                let label = member_labels
+                                    .get(key)
+                                    .cloned()
+                                    .unwrap_or_else(|| key.clone());
                                 ui.selectable_value(
                                     &mut self.odds_scope,
-                                    OddsScope::Member(name.clone()),
-                                    format!("会员：{name}"),
+                                    OddsScope::Member(key.clone()),
+                                    format!("会员：{label}"),
                                 );
                             }
                         });
@@ -7524,7 +8812,7 @@ impl ViewerApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.odds_new_member)
-                            .hint_text("会员昵称")
+                            .hint_text("会员昵称（全局）")
                             .desired_width(150.0),
                     );
                     let name = self.odds_new_member.trim().to_string();
@@ -7536,15 +8824,22 @@ impl ViewerApp {
                         .on_hover_text("单独给这个会员设置赔率 / 回水，优先于分组")
                         .clicked()
                     {
-                        add_member = Some(name);
+                        // 手输昵称仍按昵称存一份全局覆盖；能从注单里找到来源时，
+                        // 顺带把它所属分组当作复制基准。
+                        let group = self
+                            .orders
+                            .iter()
+                            .find(|r| r.nick == name)
+                            .and_then(|r| self.group_with_odds_for(&r.chat, &r.sender));
+                        add_member = Some((name, group));
                     }
                     if !candidates.is_empty() {
                         egui::ComboBox::from_id_salt("odds_member_pick")
                             .selected_text(RichText::new("从注单选择会员…").size(11.5))
                             .show_ui(ui, |ui| {
-                                for name in &candidates {
-                                    if ui.selectable_label(false, name).clicked() {
-                                        add_member = Some(name.clone());
+                                for (key, label, group) in &candidates {
+                                    if ui.selectable_label(false, label).clicked() {
+                                        add_member = Some((key.clone(), group.clone()));
                                     }
                                 }
                             });
@@ -7598,9 +8893,11 @@ impl ViewerApp {
                     );
                 } else if matches!(self.odds_scope, OddsScope::Member(_)) {
                     ui.label(
-                        RichText::new("会员覆盖优先于分组，只影响这个昵称的注单。")
-                            .size(10.5)
-                            .color(SUB),
+                        RichText::new(
+                            "会员覆盖优先于分组；从注单选择的会员按「群聊 / 会话 + 发送人」区分，同名但来源不同的会员可以各设一份。",
+                        )
+                        .size(10.5)
+                        .color(SUB),
                     );
                 }
 
@@ -7703,14 +9000,9 @@ impl ViewerApp {
                 });
             });
 
-        if let Some(name) = add_member {
-            let group = self
-                .orders
-                .iter()
-                .find(|r| r.nick == name)
-                .and_then(|r| self.group_with_odds_for(&r.chat, &r.sender));
-            self.odds_draft.ensure_member(&name, group.as_deref());
-            self.odds_scope = OddsScope::Member(name);
+        if let Some((key, group)) = add_member {
+            self.odds_draft.ensure_member(&key, group.as_deref());
+            self.odds_scope = OddsScope::Member(key);
             self.odds_new_member.clear();
         }
         if reset_region {
@@ -8174,6 +9466,33 @@ impl ViewerApp {
             }
             self.selection_dirty = true;
         }
+        // 右键：直接把这个联系人加入 / 移出任意会员分组，不用再回到顶部勾选。
+        let mut toggle_group: Option<(usize, bool)> = None;
+        resp.context_menu(|ui| {
+            compact_context_menu(ui);
+            ui.label(RichText::new("加入 / 移出会员分组").size(10.5).color(SUB));
+            if self.groups.is_empty() {
+                ui.label(RichText::new("还没有分组").size(11.0).color(MUTED));
+            }
+            for (i, g) in self.groups.iter().enumerate() {
+                let in_group = g.contacts.contains(&p.username);
+                if ui.selectable_label(in_group, g.name.as_str()).clicked() {
+                    toggle_group = Some((i, !in_group));
+                    ui.close();
+                }
+            }
+        });
+        if let Some((i, add)) = toggle_group {
+            if add {
+                self.groups[i].contacts.insert(p.username.clone());
+            } else {
+                self.groups[i].contacts.remove(&p.username);
+                self.groups[i].upline_contacts.remove(&p.username);
+                self.selected_contacts.remove(&p.username);
+            }
+            groups::save(&self.groups);
+            self.selection_dirty = true;
+        }
         resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     }
 
@@ -8282,6 +9601,38 @@ impl ViewerApp {
             }
             self.selection_dirty = true;
         }
+        // 右键：整群成员一键全选 / 取消全选。
+        let mut select_all_members: Option<bool> = None;
+        resp.context_menu(|ui| {
+            compact_context_menu(ui);
+            if !g.has_member_list || g.members.is_empty() {
+                ui.label(RichText::new("成员列表未同步").size(11.0).color(MUTED));
+                return;
+            }
+            if ui
+                .button(format!("全选 {} 个成员", g.members.len()))
+                .clicked()
+            {
+                select_all_members = Some(true);
+                ui.close();
+            }
+            if ui.button("取消全选本群成员").clicked() {
+                select_all_members = Some(false);
+                ui.close();
+            }
+        });
+        if let Some(select) = select_all_members {
+            self.expanded.insert(g.username.clone());
+            for m in &g.members {
+                let key = (g.username.clone(), m.username.clone());
+                if select {
+                    self.selected_members.insert(key);
+                } else {
+                    self.selected_members.remove(&key);
+                }
+            }
+            self.selection_dirty = true;
+        }
         resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     }
 
@@ -8314,8 +9665,35 @@ impl ViewerApp {
             if selected {
                 self.selected_members.remove(&key);
             } else {
-                self.selected_members.insert(key);
+                self.selected_members.insert(key.clone());
             }
+            self.selection_dirty = true;
+        }
+        // 右键：直接把这个群成员加入 / 移出任意会员分组。
+        let mut toggle_group: Option<(usize, bool)> = None;
+        resp.context_menu(|ui| {
+            compact_context_menu(ui);
+            ui.label(RichText::new("加入 / 移出会员分组").size(10.5).color(SUB));
+            if self.groups.is_empty() {
+                ui.label(RichText::new("还没有分组").size(11.0).color(MUTED));
+            }
+            for (i, mg) in self.groups.iter().enumerate() {
+                let in_group = mg.members.contains(&key);
+                if ui.selectable_label(in_group, mg.name.as_str()).clicked() {
+                    toggle_group = Some((i, !in_group));
+                    ui.close();
+                }
+            }
+        });
+        if let Some((i, add)) = toggle_group {
+            if add {
+                self.groups[i].members.insert(key.clone());
+            } else {
+                self.groups[i].members.remove(&key);
+                self.groups[i].upline_members.remove(&key);
+                self.selected_members.remove(&key);
+            }
+            groups::save(&self.groups);
             self.selection_dirty = true;
         }
         resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -8405,11 +9783,8 @@ impl ViewerApp {
                     .show(ui, |ui| {
                         ui.label(RichText::new("日期").size(13.0).color(SUB));
                         ui.horizontal(|ui| {
-                            ui.add(
-                                egui_extras::DatePickerButton::new(&mut self.import_date)
-                                    .id_salt("import_date")
-                                    .format("%Y-%m-%d"),
-                            );
+                            // 中文年 / 月 / 日下拉，不用英文日历。
+                            date_picker_zh(ui, &mut self.import_date);
                             let date_btn = |ui: &mut egui::Ui, text: &str| {
                                 ui.add(
                                     egui::Button::new(RichText::new(text).size(13.5).color(TEXT))
@@ -8737,11 +10112,28 @@ impl ViewerApp {
         }
     }
 
+    /// 当前时段内的已撤回记录（按原消息的 sort 毫秒判断）。
+    fn revoked_in_range(&self) -> Vec<&crate::revoked::RevokedRow> {
+        let Some((start_ts, end_ts)) = self.import_range_ts() else {
+            return self.revoked.values().collect();
+        };
+        let start = start_ts.saturating_mul(1000);
+        let end = end_ts.saturating_mul(1000).saturating_add(999);
+        self.revoked
+            .values()
+            .filter(|r| r.sort >= start && r.sort <= end)
+            .collect()
+    }
+
     fn perform_clear(&mut self) {
+        let clear_all = self.clear_groups.is_empty() && self.clear_members.is_empty();
+        let cleared_groups = self.clear_groups.clone();
+        let cleared_members = self.clear_members.clone();
+
         self.orders = clear_orders(
             std::mem::take(&mut self.orders),
-            &self.clear_groups,
-            &self.clear_members,
+            &cleared_groups,
+            &cleared_members,
         );
         self.order_keys = self
             .orders
@@ -8750,6 +10142,20 @@ impl ViewerApp {
             .collect();
         let live: HashSet<EditKey> = self.orders.iter().map(edit_key).collect();
         self.auto_converted.retain(|k, _| live.contains(k));
+
+        // 已撤回名单跟着一起清：不勾选 = 全部；勾了会员则清掉对应会话 / 发送人的记录。
+        let before = self.revoked.len();
+        if clear_all {
+            self.revoked.clear();
+        } else {
+            self.revoked.retain(|_, r| {
+                !(cleared_groups.contains(&r.chat)
+                    || cleared_members.contains(&(r.chat.clone(), r.sender.clone())))
+            });
+        }
+        if self.revoked.len() != before {
+            crate::revoked::save(&self.revoked);
+        }
         self.last_update = now_hms();
     }
 
@@ -8823,16 +10229,20 @@ impl Drop for ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 加载结果先处理：登录页上的「微信是否已登录」提示就靠它。
+        self.poll();
         self.poll_auth();
+        self.sync_window_title(&ctx);
         // 没登录（或心跳发现令牌失效）时只画登录页。
         if !self.auth.authenticated() {
             self.login_ui(&ctx);
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
-        self.poll();
         self.poll_import();
         self.poll_monitor();
+        self.poll_ocr(&ctx);
+        self.poll_quote_fetch(&ctx);
 
         egui::Panel::top("wv_header")
             .frame(
@@ -8841,7 +10251,7 @@ impl eframe::App for ViewerApp {
                     .inner_margin(Margin::symmetric(14, 3))
                     .stroke(Stroke::new(1.0, Color32::from_rgb(0x46, 0x4D, 0x54))),
             )
-            .show(ui, |ui| self.top_bar(ui, &ctx));
+            .show(ui, |ui| self.top_bar(ui));
 
         egui::Panel::bottom("wv_status")
             .frame(
@@ -8895,6 +10305,8 @@ impl eframe::App for ViewerApp {
 
         // 独立窗口：引用类型消息列表。
         self.reference_window(&ctx);
+        // 补读到的、不在注单列表里的被引用原文。
+        self.quote_original_dialog(&ctx);
 
         if matches!(self.state, State::Loading)
             || matches!(self.orders_state, OrdersState::Loading(_))
@@ -8988,8 +10400,36 @@ impl ViewerApp {
         self.was_authenticated = now_authenticated;
     }
 
+    /// 窗口标题显示「软件版本号 · 账号 · 剩余时间」。
+    /// 账号 / 剩余时间不再占用顶部工具栏，放进系统标题栏，省出按钮空间。
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let acct = self.auth.state();
+        let title = if self.auth.authenticated() && !acct.username.is_empty() {
+            format!(
+                "账无忧 v{} · 账号 {} · 剩余 {}",
+                env!("CARGO_PKG_VERSION"),
+                acct.username,
+                short_remaining(&acct.remaining_text)
+            )
+        } else {
+            format!("账无忧 v{}", env!("CARGO_PKG_VERSION"))
+        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+    }
+
     /// 登录页：没登录时铺满整个窗口。
     fn login_ui(&mut self, ctx: &egui::Context) {
+        // 微信刚被启动时等几秒再自动检测一次：它多半会自动登录，
+        // 登录完成后内存里才会出现数据库密钥。
+        if self.wx_auto_check_at.is_some_and(|at| Instant::now() >= at) {
+            self.wx_auto_check_at = None;
+            if !matches!(self.state, State::Loading) {
+                self.refresh(ctx);
+            }
+        }
         let screen = ctx.content_rect();
         egui::Area::new(egui::Id::unique("login_backdrop"))
             .order(egui::Order::Middle)
@@ -9003,25 +10443,48 @@ impl ViewerApp {
                 ui.allocate_rect(screen, Sense::hover());
             });
 
+        let (wx_color, wx_text, wx_tip) = self.wechat_login_status();
         egui::Window::new("login_panel")
             .title_bar(false)
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
-            .fixed_size([380.0, 300.0])
+            .fixed_size([400.0, 322.0])
             .show(ctx, |ui| {
-                ui.set_min_width(340.0);
+                ui.set_min_width(360.0);
                 ui.vertical_centered(|ui| {
                     ui.add_space(4.0);
                     ui.label(RichText::new("账无忧 · 登录").size(20.0).strong().color(TEXT));
-                    ui.label(
-                        RichText::new(format!("服务器：{}", self.auth.server_url()))
-                            .size(10.0)
-                            .color(MUTED),
-                    );
                 });
-                ui.add_space(10.0);
+                ui.add_space(8.0);
+                // 微信登录状态：绿色 = 确认已登录；金色 = 未登录 / 无法确认。
+                let (wx_fill, wx_border) = if wx_color == GREEN {
+                    (GREEN_TINT, Color32::from_rgb(0xBF, 0xE3, 0xCF))
+                } else {
+                    (GOLD_BG, Color32::from_rgb(0xEF, 0xD8, 0xA6))
+                };
+                egui::Frame::new()
+                    .fill(wx_fill)
+                    .stroke(Stroke::new(1.0, wx_border))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.label(RichText::new("●").size(9.0).color(wx_color));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&wx_text).size(11.0).color(wx_color),
+                                )
+                                .truncate(),
+                            );
+                        })
+                        .response
+                        .on_hover_text(&wx_tip);
+                    });
+                ui.add_space(8.0);
                 ui.label(RichText::new("账号").size(12.0).color(SUB));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.login_user)
@@ -9037,7 +10500,20 @@ impl ViewerApp {
                         .hint_text("请输入密码"),
                 );
                 ui.add_space(4.0);
-                ui.checkbox(&mut self.login_remember, RichText::new("记住密码").size(11.5));
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.login_remember, RichText::new("记住密码").size(11.5));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let loading = matches!(self.state, State::Loading);
+                        let color = if loading { MUTED } else { GREEN_DEEP };
+                        if ui
+                            .add_enabled(!loading, tiny_button("重新检测", color))
+                            .on_hover_text("重新读取微信数据，确认当前微信登录状态")
+                            .clicked()
+                        {
+                            self.refresh(ctx);
+                        }
+                    });
+                });
                 ui.add_space(6.0);
                 if let Some((is_error, msg)) = &self.login_msg {
                     // 错误用红色；「被顶下线 / 已退出 / 尝试过多」用警告色。
@@ -9045,21 +10521,31 @@ impl ViewerApp {
                     ui.label(RichText::new(msg).size(11.0).color(color));
                 }
                 let inflight = self.login_rx.is_some();
+                // 还在检测微信登录状态时先不让登录，避免状态没确认就往下走。
+                let checking = matches!(self.state, State::Loading);
+                let can_login = !inflight && !checking;
                 let enter = pass_resp.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
                     if primary_button(
                         ui,
-                        RichText::new(if inflight { "登录中…" } else { "登录" })
-                            .size(13.0)
-                            .color(Color32::WHITE),
-                        !inflight,
+                        RichText::new(if inflight {
+                            "登录中…"
+                        } else if checking {
+                            "检测中…"
+                        } else {
+                            "登录"
+                        })
+                        .size(13.0)
+                        // 禁用时文字用灰色，避免白字落在浅色禁用底上看不见。
+                        .color(if can_login { Color32::WHITE } else { SUB }),
+                        can_login,
                         CornerRadius::same(6),
                         Vec2::new(140.0, 30.0),
                     )
                     .clicked()
-                        || (enter && !inflight)
+                        || (enter && can_login)
                     {
                         self.submit_login();
                     }
@@ -9067,8 +10553,97 @@ impl ViewerApp {
             });
     }
 
+    /// 登录页顶部「微信登录状态」：颜色、文案、悬浮说明。
+    ///
+    /// 判据来自后台加载器：密钥必须是从**正在运行的微信进程内存**里拿到的，
+    /// 才算当前确实已登录；用本地缓存解开的数据库只能说明「以前登录过」。
+    fn wechat_login_status(&mut self) -> (Color32, String, String) {
+        // 登录页每 100ms 重绘一次，进程快照每秒最多建一个。
+        let now = Instant::now();
+        let was_running = self.wx_proc_running;
+        if self
+            .wx_proc_checked
+            .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(1))
+        {
+            self.wx_proc_running = !crate::keyextract::weixin_pids().is_empty();
+            self.wx_proc_checked = Some(now);
+        }
+        if self.wx_proc_running && !was_running {
+            // 刚启动：4 秒后自动重检一次，给微信自动登录留时间。
+            self.wx_auto_check_at = Some(now + Duration::from_secs(4));
+        } else if !self.wx_proc_running {
+            self.wx_auto_check_at = None;
+        }
+        match &self.state {
+            State::Loading => {
+                let tip = if self.status.is_empty() {
+                    "正在读取微信数据，并确认数据库密钥是否来自正在运行的微信进程。".to_string()
+                } else {
+                    format!(
+                        "{}\n正在确认数据库密钥是否来自正在运行的微信进程。",
+                        self.status
+                    )
+                };
+                (SUB, "正在检测微信登录状态…".to_string(), tip)
+            }
+            State::Ready(d) if d.key_live && self.wx_proc_running => (
+                GREEN,
+                format!("当前微信已登录：{}", d.self_name),
+                format!(
+                    "微信账号：{}（{}）\n数据目录：{}",
+                    d.self_name, d.self_wxid, d.data_dir
+                ),
+            ),
+            State::Ready(d) if d.key_live => (
+                GOLD_FG,
+                "微信进程已退出（上次检测时已登录）".to_string(),
+                format!(
+                    "本次检测时微信处于登录状态，但 Weixin.exe 现在已不在运行。\n微信账号：{}（{}）",
+                    d.self_name, d.self_wxid
+                ),
+            ),
+            State::Ready(d) => {
+                let tip = format!(
+                    "本次数据来自「{}」，只能说明以前登录过微信。\n微信账号：{}（{}）",
+                    d.key_source, d.self_name, d.self_wxid
+                );
+                if self.wx_proc_running {
+                    (
+                        GOLD_FG,
+                        "无法确认微信登录状态，可点「重新检测」".to_string(),
+                        format!(
+                            "{tip}\n可能原因：微信还停在登录界面，或本程序与微信的权限不一致（可尝试以管理员身份运行本程序）。"
+                        ),
+                    )
+                } else {
+                    (
+                        GOLD_FG,
+                        "微信未运行，当前使用本地缓存数据".to_string(),
+                        tip,
+                    )
+                }
+            }
+            State::Failed(err) => {
+                let tip = format!("{err}\n\n若微信已经登录，请点「重新检测」。");
+                if self.wx_proc_running {
+                    (
+                        GOLD_FG,
+                        "请在微信中完成登录后点「重新检测」".to_string(),
+                        format!("{tip}\n若微信已登录仍提示失败，请试试以管理员身份运行本程序。"),
+                    )
+                } else {
+                    (
+                        GOLD_FG,
+                        "未检测到微信登录，请先启动并登录微信".to_string(),
+                        tip,
+                    )
+                }
+            }
+        }
+    }
+
     fn submit_login(&mut self) {
-        if self.login_rx.is_some() {
+        if self.login_rx.is_some() || matches!(self.state, State::Loading) {
             return;
         }
         let user = self.login_user.trim().to_string();
@@ -9087,7 +10662,28 @@ impl ViewerApp {
         });
     }
 
-    /// 「授权」弹窗：当前账号、到期时间、备注、服务器，以及改密 / 退出登录。
+    /// 打开 / 关闭「授权」弹窗；打开时后台刷新一次账号信息，免得显示旧的到期日。
+    fn toggle_auth_dialog(&mut self) {
+        self.auth_open = !self.auth_open;
+        if !self.auth_open {
+            return;
+        }
+        self.pwd_msg = None;
+        self.pwd_old.clear();
+        self.pwd_new.clear();
+        self.pwd_confirm.clear();
+        if self.auth_refresh_rx.is_none() {
+            let auth = self.auth.clone();
+            let (tx, rx) = channel();
+            self.auth_refresh_rx = Some(rx);
+            std::thread::spawn(move || {
+                auth.refresh();
+                let _ = tx.send(());
+            });
+        }
+    }
+
+    /// 「授权」弹窗：当前账号、到期时间、备注，以及改密 / 退出登录。
     fn auth_dialog(&mut self, ctx: &egui::Context) {
         if !self.auth_open {
             return;
@@ -9102,19 +10698,14 @@ impl ViewerApp {
             .show(ctx, |ui| {
                 window_header_cursor(ui);
                 ui.horizontal(|ui| {
-                    risk_stat_card(ui, "账号", &state.username, TEXT, 180.0);
-                    risk_stat_card(ui, "账号到期", &state.remaining_text, TEXT, 180.0);
+                    auth_stat_card(ui, "账号", &state.username, TEXT, 180.0);
+                    auth_stat_card(ui, "账号到期", &state.remaining_text, TEXT, 180.0);
                 });
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(format!("备注：{}", if state.note.is_empty() { "—" } else { &state.note }))
                         .size(11.5)
                         .color(SUB),
-                );
-                ui.label(
-                    RichText::new(format!("服务器：{}", state.server_url))
-                        .size(10.5)
-                        .color(MUTED),
                 );
                 ui.label(
                     RichText::new("到期时间、账号问题都请联系管理员。")
@@ -9213,6 +10804,69 @@ impl ViewerApp {
 /// - 没有勾选任何会员 → 清空全部；
 /// - 勾选了群/会话 → 清空该会话的全部行；
 /// - 勾选了群成员 → 只清空该成员在该群的行。
+/// 中文日期选择：年 / 月 / 日三个下拉，避免 egui_extras 自带的英文日历。
+fn date_picker_zh(ui: &mut egui::Ui, date: &mut JDate) {
+    let mut year = date.year();
+    let mut month = date.month();
+    let mut day = date.day();
+    let now_year = jiff::Zoned::now().year();
+
+    egui::ComboBox::from_id_salt("import_date_year")
+        .width(82.0)
+        .selected_text(RichText::new(format!("{year}年")).size(13.0))
+        .show_ui(ui, |ui| {
+            let start = (now_year - 10).min(year);
+            let end = (now_year + 1).max(year);
+            for y in start..=end {
+                if ui.selectable_label(y == year, format!("{y}年")).clicked() {
+                    year = y;
+                }
+            }
+        });
+    egui::ComboBox::from_id_salt("import_date_month")
+        .width(62.0)
+        .selected_text(RichText::new(format!("{month}月")).size(13.0))
+        .show_ui(ui, |ui| {
+            for m in 1..=12i8 {
+                if ui.selectable_label(m == month, format!("{m}月")).clicked() {
+                    month = m;
+                }
+            }
+        });
+    let max_day = days_in_month(year, month);
+    if day > max_day {
+        day = max_day;
+    }
+    egui::ComboBox::from_id_salt("import_date_day")
+        .width(62.0)
+        .selected_text(RichText::new(format!("{day}日")).size(13.0))
+        .show_ui(ui, |ui| {
+            for d in 1..=max_day {
+                if ui.selectable_label(d == day, format!("{d}日")).clicked() {
+                    day = d;
+                }
+            }
+        });
+    if let Ok(next) = JDate::new(year, month, day) {
+        *date = next;
+    }
+}
+
+fn days_in_month(year: i16, month: i8) -> i8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 31,
+    }
+}
+
 fn clear_orders(
     orders: Vec<MsgRow>,
     groups: &HashSet<String>,
@@ -9321,6 +10975,59 @@ fn display_of_member(data: &AppData, chat: &str, member: &str) -> String {
     format!("{group_name} / {member_name}")
 }
 
+/// 会员赔率覆盖的「来源身份」：同一会话 + 发送人。
+/// 同名但来自不同群聊 / 会话的会员因此能各存一份覆盖。
+fn member_identity(chat: &str, sender: &str) -> String {
+    format!("m:{chat}:{sender}")
+}
+
+fn identity_parts(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix("m:")?.split_once(':')
+}
+
+/// 赔率弹窗里的会员显示名：`昵称（群名 / 联系人）`。
+fn identity_label(chat: &str, sender: &str, nick: &str, data: Option<&AppData>) -> String {
+    if chat.ends_with("@chatroom") {
+        let group = data.and_then(|d| d.groups.iter().find(|g| g.username == chat));
+        let group_name = group
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| chat.to_string());
+        let person = group
+            .and_then(|g| g.members.iter().find(|p| p.username == sender))
+            .map(|p| p.display_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if nick.is_empty() {
+                    sender.to_string()
+                } else {
+                    nick.to_string()
+                }
+            });
+        format!("{person}（{group_name}）")
+    } else {
+        let person = data
+            .and_then(|d| d.contacts.iter().find(|p| p.username == sender))
+            .map(|p| p.display_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if nick.is_empty() {
+                    sender.to_string()
+                } else {
+                    nick.to_string()
+                }
+            });
+        format!("{person}（联系人）")
+    }
+}
+
+/// 已保存的会员覆盖键 → 显示名。旧版按昵称保存的键原样显示。
+fn member_key_label(key: &str, data: Option<&AppData>) -> String {
+    match identity_parts(key) {
+        Some((chat, sender)) => identity_label(chat, sender, "", data),
+        None => key.to_string(),
+    }
+}
+
 fn build_name_map(data: &AppData) -> HashMap<String, String> {
     let mut name_of: HashMap<String, String> = HashMap::new();
     for p in &data.contacts {
@@ -9355,12 +11062,88 @@ fn group_filters(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_draw_row, clear_orders, find_quoted_image_index, group_filters,
-        parse_draw_paste, quote_match_score, source_from_groups,
+        check_draw_row, clear_orders, find_quote_in_rows, find_quoted_image_index,
+        find_revoke_target, group_filters, parse_draw_paste, quote_match_score, revoke_actor,
+        revoke_candidates, source_from_groups,
     };
     use crate::model::{MemberGroup, MsgRow, QuoteRef};
     use eframe::egui;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    /// 顶部开奖号码下面要显示每个号码对应的生肖（平码 + 特码）。
+    #[test]
+    fn draw_summary_shows_zodiac_under_numbers() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut draws = crate::draw::Draws::default();
+        draws.macau = crate::draw::RegionDraw {
+            draw: vec![1, 2, 3, 4, 5, 6],
+            special: Some(7),
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui(move |ui| {
+                super::install_fonts(ui.ctx());
+                super::draw_summary_ui(ui, &draws, "开奖：");
+            });
+        harness.run();
+        // 1..=6 依次是 马 蛇 龙 兔 虎 牛，特码 7 是鼠。
+        for zodiac in ["马", "蛇", "龙", "兔", "虎", "牛", "鼠"] {
+            assert!(
+                harness.get_all_by_label(zodiac).next().is_some(),
+                "号码下方的生肖「{zodiac}」没有显示"
+            );
+        }
+    }
+
+    /// 开奖摘要放在横向布局里（风险页）时，生肖行仍要排在号码球下方，
+    /// 不能被 Frame 继承横向布局排到右边、把彩种框撑宽。
+    #[test]
+    fn draw_summary_stacks_zodiacs_below_numbers_in_horizontal_parent() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut draws = crate::draw::Draws::default();
+        draws.macau = crate::draw::RegionDraw {
+            draw: vec![1, 2, 3, 4, 5, 6],
+            special: Some(7),
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_accessibility_check(false)
+            .with_size(egui::vec2(600.0, 200.0))
+            .build_ui(move |ui| {
+                super::install_fonts(ui.ctx());
+                ui.horizontal(|ui| {
+                    ui.label("页签");
+                    super::draw_summary_ui(ui, &draws, "");
+                });
+            });
+        harness.run();
+        let name = harness
+            .get_all_by_label("澳")
+            .next()
+            .expect("地区名")
+            .rect();
+        for zodiac in ["马", "蛇", "龙", "兔", "虎", "牛", "鼠"] {
+            let node = harness
+                .get_all_by_label(zodiac)
+                .next()
+                .unwrap_or_else(|| panic!("生肖「{zodiac}」没画"));
+            assert!(
+                node.rect().top() >= name.bottom(),
+                "生肖「{zodiac}」应该排在号码球下方：zodiac={:?} name={:?}",
+                node.rect(),
+                name
+            );
+        }
+    }
+
+    /// 窗口标题里的剩余时间只显示最大的时间单位。
+    #[test]
+    fn remaining_title_text_keeps_largest_unit() {
+        assert_eq!(super::short_remaining("365天 12小时 35分钟"), "365天");
+        assert_eq!(super::short_remaining("12小时 35分钟"), "12小时");
+        assert_eq!(super::short_remaining("永不过期"), "永不过期");
+    }
 
     #[test]
     fn window_header_shows_move_cursor() {
@@ -9491,6 +11274,170 @@ mod tests {
             ..reference
         };
         assert_eq!(find_quoted_image_index(&orders, &wrong, wrong.quote.as_ref().unwrap()), None);
+    }
+
+    #[test]
+    fn find_quote_in_rows_matches_text_and_empty_content() {
+        let msg = |kind: &str, sender: &str, nick: &str, time: &str, content: &str, sort: i64| MsgRow {
+            kind: kind.to_string(),
+            nick: nick.to_string(),
+            content: content.to_string(),
+            time: time.to_string(),
+            sort,
+            chat: "g1".to_string(),
+            sender: sender.to_string(),
+            link_url: None,
+            quote: None,
+        };
+
+        // 文字引用：按正文匹配。
+        let rows = vec![
+            msg("文字", "u2", "李四", "21:01", "别的消息", 1),
+            msg("文字", "u1", "张三", "21:02", "三中三 01,02,03 各10", 2),
+        ];
+        let quote = QuoteRef {
+            content: "三中三 01,02,03 各10".to_string(),
+            from: "张三".to_string(),
+            from_usr: "u1".to_string(),
+            create_time: 0,
+            msg_type: 1,
+        };
+        let host = MsgRow {
+            quote: Some(quote.clone()),
+            ..msg("引用", "u3", "王五", "21:05", "", 3)
+        };
+        let found = find_quote_in_rows(&rows, &host, &quote).expect("应该找到文字原文");
+        assert_eq!(found.content, "三中三 01,02,03 各10");
+
+        // 语音 / 视频等没有可读正文：同会话 + 发送人 + 时间最近的兜底。
+        let rows = vec![
+            msg("语音", "u1", "张三", "21:01", "[语音]", 1_700_000_000_000),
+            msg("语音", "u2", "李四", "21:01", "[语音]", 1_700_000_001_000),
+        ];
+        let quote = QuoteRef {
+            content: String::new(),
+            from: "张三".to_string(),
+            from_usr: "u1".to_string(),
+            create_time: 1_700_000_000,
+            msg_type: 34,
+        };
+        let host = MsgRow {
+            quote: Some(quote.clone()),
+            ..msg("引用", "u3", "王五", "21:05", "", 3)
+        };
+        let found = find_quote_in_rows(&rows, &host, &quote).expect("应该按发送人找到语音");
+        assert_eq!(found.sender, "u1");
+    }
+
+    #[test]
+    fn revoke_notice_extracts_actor_and_target() {
+        assert_eq!(
+            revoke_actor("\"一羊迁徙\" 撤回了一条消息").as_deref(),
+            Some("一羊迁徙")
+        );
+        assert_eq!(revoke_actor("你撤回了一条消息").as_deref(), Some("你"));
+        assert_eq!(revoke_actor("普通消息"), None);
+
+        let msg = |chat: &str, sender: &str, nick: &str, content: &str, sort: i64| MsgRow {
+            kind: "文字".to_string(),
+            nick: nick.to_string(),
+            content: content.to_string(),
+            time: "21:00".to_string(),
+            sort,
+            chat: chat.to_string(),
+            sender: sender.to_string(),
+            link_url: None,
+            quote: None,
+        };
+        let revoke = MsgRow {
+            kind: "撤回".to_string(),
+            nick: String::new(),
+            content: "\"张三\" 撤回了一条消息".to_string(),
+            time: "21:04".to_string(),
+            sort: 3000,
+            chat: "g1@chatroom".to_string(),
+            sender: String::new(),
+            link_url: None,
+            quote: None,
+        };
+
+        // 群聊：按撤回提示里的昵称匹配，取该发送人最近一条。
+        let orders = vec![
+            msg("g1@chatroom", "u2", "李四", "别人的消息", 1000),
+            msg("g1@chatroom", "u1", "张三", "更早的张三消息", 1500),
+            msg("g1@chatroom", "u1", "张三", "被撤回的消息", 2000),
+        ];
+        let found = find_revoke_target(&revoke, &orders, &[], "self", &HashMap::new())
+            .expect("应该找到张三最近一条");
+        assert_eq!(found.content, "被撤回的消息");
+
+        // 群昵称 / 备注名对不上时，用「名字 → username」再匹配。
+        let orders = vec![msg("g1@chatroom", "u1", "备注张三", "被撤回的消息", 2000)];
+        let mut names = HashMap::new();
+        names.insert("张三".to_string(), "u1".to_string());
+        let found = find_revoke_target(&revoke, &orders, &[], "self", &names)
+            .expect("名字映射应该能兜住");
+        assert_eq!(found.content, "被撤回的消息");
+
+        // 「你撤回了一条消息」：匹配自己发的最近一条。
+        let revoke_self = MsgRow {
+            content: "你撤回了一条消息".to_string(),
+            sort: 5000,
+            chat: "wxid_b".to_string(),
+            ..revoke
+        };
+        let orders = vec![
+            msg("wxid_b", "self", "我", "自己发的", 4000),
+            msg("wxid_b", "wxid_b", "对方", "对方发的", 4500),
+        ];
+        let found = find_revoke_target(&revoke_self, &orders, &[], "self", &HashMap::new())
+            .expect("应该找到自己发的");
+        assert_eq!(found.content, "自己发的");
+    }
+
+    /// 重新导入时，已撤回的原消息虽然不再显示，仍要留在撤回匹配候选池里；
+    /// 否则撤回提示会匹配到更早的同发送人消息，把正常消息误记成「已撤回」。
+    #[test]
+    fn revoke_candidates_keep_already_revoked_original() {
+        let msg = |content: &str, kind: &str, sort: i64| MsgRow {
+            kind: kind.to_string(),
+            nick: "张三".to_string(),
+            content: content.to_string(),
+            time: "21:00".to_string(),
+            sort,
+            chat: "g1@chatroom".to_string(),
+            sender: "u1".to_string(),
+            link_url: None,
+            quote: None,
+        };
+        let earlier = msg("更早的正常消息", "文字", 1500);
+        let revoked_original = msg("被撤回的注单", "文字", 2000);
+        let notice = msg("\"张三\" 撤回了一条消息", "撤回", 3000);
+
+        let candidates = revoke_candidates(&[earlier, revoked_original, notice.clone()]);
+        assert_eq!(candidates.len(), 2, "撤回提示本身不应进入候选池");
+
+        let found = find_revoke_target(&notice, &[], &candidates, "self", &HashMap::new())
+            .expect("应该找到被撤回的原消息");
+        assert_eq!(found.content, "被撤回的注单");
+        assert_eq!(found.sort, 2000);
+    }
+
+    #[test]
+    fn code_report_text_merges_complete_zodiacs_by_amount() {
+        // 马 = 01,13,25,37,49；这一组五个号都吃了 91 → 合并成「马」。
+        let mut reduce: Vec<(u32, f64)> = vec![
+            (1, 91.0),
+            (13, 91.0),
+            (25, 91.0),
+            (37, 91.0),
+            (49, 91.0),
+            (8, 91.0),
+            (2, 50.0),
+        ];
+        reduce.sort_by_key(|(n, _)| *n);
+        let text = super::code_report_text(0, &reduce);
+        assert_eq!(text, "澳 特码\n马.8各91\n2各50");
     }
 
     #[test]
@@ -9773,6 +11720,22 @@ const TOOLBAR_TONE_RED: ToolbarTone = ToolbarTone {
     hover_edge: RED_SOLID_HOVER,
 };
 
+/// 顶部工具栏的功能分组标题：小号弱化文字，悬浮时说明本组包含什么。
+fn top_group_label(ui: &mut egui::Ui, text: &str, tip: &str) {
+    ui.label(RichText::new(text).size(9.5).color(TOOLBAR_SUB))
+        .on_hover_text(tip);
+    ui.add_space(5.0);
+}
+
+/// 顶部工具栏的分组间隔：留白 + 浅色竖线 + 留白。
+fn top_group_gap(ui: &mut egui::Ui) {
+    ui.add_space(9.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 16.0), Sense::hover());
+    ui.painter()
+        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0, TOOLBAR_BTN_EDGE));
+    ui.add_space(9.0);
+}
+
 /// 顶部深色工具栏的按钮：深底上的浅色按钮，白字；禁用时无填充、灰字、灰边。
 fn top_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
     top_button_tone(ui, text, width, true, TOOLBAR_TONE)
@@ -9822,6 +11785,11 @@ fn top_button_tone(
         )
     })
     .inner
+}
+
+/// 窗口标题里只显示最大的一个时间单位（如「365天」），完整时间在「权限」弹窗里。
+fn short_remaining(text: &str) -> &str {
+    text.split_whitespace().next().unwrap_or(text)
 }
 
 /// 多行文本框的右键菜单：剪切 / 复制 / 粘贴 / 全选。
@@ -9991,6 +11959,32 @@ fn tiny_button(text: &str, color: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text).size(11.5).color(color))
         .corner_radius(CornerRadius::same(6))
         .min_size(Vec2::new(0.0, 24.0))
+}
+
+/// 「注单消息」面板顶部的小页签（未撤回 / 引用 / 已撤回）。
+fn order_tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    // 页签做紧凑一点，把高度留给下面的消息列表。
+    let mut style = (**ui.style()).clone();
+    style.spacing.button_padding = Vec2::new(8.0, 1.0);
+    ui.scope(|ui| {
+        ui.set_style(style);
+        ui.add(
+            egui::Button::new(
+                RichText::new(text)
+                    .size(10.0)
+                    .strong()
+                    .color(if selected { GREEN_DEEP } else { SUB }),
+            )
+            .fill(if selected { GREEN_TINT } else { CARD })
+            .stroke(Stroke::new(
+                1.0,
+                if selected { GREEN } else { BORDER },
+            ))
+            .corner_radius(CornerRadius::same(5))
+            .min_size(Vec2::new(0.0, 20.0)),
+        )
+    })
+    .inner
 }
 
 fn tab_button(ui: &mut egui::Ui, label: String, selected: bool) -> bool {
@@ -10613,14 +12607,10 @@ fn detail_content_width(ui: &egui::Ui, content: &str, mul_sep: &str) -> f32 {
                     + 8.0
             }
             DetailContentPart::Sep(s) => {
-                let label = if s.eq_ignore_ascii_case("t") {
-                    "拖".to_string()
-                } else {
-                    s
-                };
+                let (label, _) = detail_sep_display(&s);
                 ui.painter()
                     .layout_no_wrap(
-                        label,
+                        label.to_string(),
                         FontId::proportional(11.0),
                         Color32::PLACEHOLDER,
                     )
@@ -10830,14 +12820,8 @@ fn detail_content_cell(
                             match part {
                                 DetailContentPart::Token(t) => detail_token_box(ui, &t),
                                 DetailContentPart::Sep(s) => {
-                                    let label = if s.eq_ignore_ascii_case("t") {
-                                        "拖".to_string()
-                                    } else {
-                                        s
-                                    };
-                                    ui.label(
-                                        RichText::new(label).size(11.0).color(MUTED),
-                                    );
+                                    let (label, color) = detail_sep_display(&s);
+                                    ui.label(RichText::new(label).size(11.0).color(color));
                                 }
                             }
                         }
@@ -10860,16 +12844,41 @@ fn detail_content_parts(content: &str, mul_sep: &str) -> Vec<DetailContentPart> 
             if i > 0 {
                 parts.push(DetailContentPart::Sep(mul_sep.to_string()));
             }
-            for tok in detail_split_tokens(group) {
-                parts.push(DetailContentPart::Token(tok));
-            }
+            push_detail_group(&mut parts, group);
         }
     } else {
-        for tok in detail_split_tokens(content) {
+        push_detail_group(&mut parts, content);
+    }
+    parts
+}
+
+/// 把一段内容切成方块。内容里残留的「拖」（分隔词配置成碰 / t 等时可能出现）
+/// 也按组间分隔符处理，保证内容列的「拖」统一显示成红色「X」。
+fn push_detail_group(parts: &mut Vec<DetailContentPart>, group: &str) {
+    for tok in detail_split_tokens(group) {
+        if tok.contains('拖') {
+            for (i, seg) in tok.split('拖').enumerate() {
+                if i > 0 {
+                    parts.push(DetailContentPart::Sep("拖".to_string()));
+                }
+                if !seg.is_empty() {
+                    parts.push(DetailContentPart::Token(seg.to_string()));
+                }
+            }
+        } else {
             parts.push(DetailContentPart::Token(tok));
         }
     }
-    parts
+}
+
+/// 内容列的分隔符显示：「拖」（配置成 t / T 时同样）统一显示成红色「X」。
+fn detail_sep_display(sep: &str) -> (&str, Color32) {
+    let t = sep.trim();
+    if t == "拖" || t.eq_ignore_ascii_case("t") {
+        ("X", RED)
+    } else {
+        (sep, MUTED)
+    }
 }
 
 fn detail_split_tokens(s: &str) -> Vec<String> {
@@ -11112,7 +13121,8 @@ fn wave_ball_color(n: u32) -> Color32 {
 }
 
 /// 一个波色号码球（开奖展示与号码盘共用）。`special` 时加一圈白描边。
-fn draw_number_ball(ui: &mut egui::Ui, n: u32, d: f32, special: bool) {
+/// 返回球占用的矩形，调用方可以据此在正下方画生肖。
+fn draw_number_ball(ui: &mut egui::Ui, n: u32, d: f32, special: bool) -> egui::Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(d), Sense::hover());
     let p = ui.painter();
     p.circle_filled(rect.center(), d / 2.0, wave_ball_color(n));
@@ -11130,6 +13140,7 @@ fn draw_number_ball(ui: &mut egui::Ui, n: u32, d: f32, special: bool) {
         bold_font(d * 0.52),
         Color32::WHITE,
     );
+    rect
 }
 
 /// 开奖号码的富样式展示：地区 + 每个号码一个波色圆圈，特码加白圈。
@@ -11165,20 +13176,59 @@ fn draw_summary_ui(ui: &mut egui::Ui, draws: &draw::Draws, prefix: &str) {
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(Margin::symmetric(6, 1))
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 3.0;
-                    ui.label(
-                        RichText::new(*name)
-                            .size(9.5)
-                            .strong()
-                            .color(region_color(i)),
-                    );
-                    for &n in &r.draw {
-                        draw_number_ball(ui, n, 17.0, false);
-                    }
-                    ui.label(RichText::new("特").size(9.0).strong().color(SPECIAL_RED));
-                    if let Some(s) = r.special {
-                        draw_number_ball(ui, s, 17.0, true);
-                    }
+                    // 外层可能是横向布局（风险页是「页签 + 开奖」一行）。
+                    // Frame 的内容 UI 会继承外层的横向布局，不强制竖排的话，
+                    // 下面的生肖行会被排到号码球右边，把彩种框撑宽、三区被裁掉。
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        // 第一行画号码球，同时记下每个球的圆心；第二行直接用这些
+                        // 圆心画生肖。两行不再各自排版，间距 / 四舍五入都不会错位。
+                        let mut balls: Vec<(f32, u32)> = Vec::new();
+                        let row = ui
+                            .horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                ui.label(
+                                    RichText::new(*name)
+                                        .size(9.5)
+                                        .strong()
+                                        .color(region_color(i)),
+                                );
+                                for &n in &r.draw {
+                                    let rect = draw_number_ball(ui, n, 17.0, false);
+                                    balls.push((rect.center().x, n));
+                                }
+                                ui.label(
+                                    RichText::new("特").size(9.0).strong().color(SPECIAL_RED),
+                                );
+                                if let Some(s) = r.special {
+                                    let rect = draw_number_ball(ui, s, 17.0, true);
+                                    balls.push((rect.center().x, s));
+                                }
+                            })
+                            .response
+                            .rect;
+                        let (strip, _) = ui
+                            .allocate_exact_size(Vec2::new(row.width(), 12.0), Sense::hover());
+                        for &(cx, n) in &balls {
+                            let zodiac = crate::settle::zodiac_of(n).unwrap_or("");
+                            if zodiac.is_empty() {
+                                continue;
+                            }
+                            // 每个生肖标签直接摆在对应球心的正下方。
+                            let cell = egui::Rect::from_center_size(
+                                egui::pos2(cx, strip.center().y),
+                                Vec2::new(17.0, 12.0),
+                            );
+                            ui.place(
+                                cell,
+                                egui::Label::new(
+                                    RichText::new(zodiac).size(9.0).color(MUTED),
+                                )
+                                .selectable(false),
+                            );
+                        }
+                    });
                 });
         }
         if !any {
@@ -11536,7 +13586,8 @@ fn reference_card(ui: &mut egui::Ui, row: &MsgRow) -> ReferenceCardAction {
             });
             ui.add_space(2.0);
             if !row.content.is_empty() {
-                ui.label(RichText::new(&row.content).size(12.5).color(TEXT));
+                // 引用消息本身的原文用红色，便于和元信息 / 被引用块区分。
+                ui.label(RichText::new(&row.content).size(12.5).color(RED));
             }
 
             if let Some(q) = &row.quote {
@@ -11624,9 +13675,6 @@ fn reference_card(ui: &mut egui::Ui, row: &MsgRow) -> ReferenceCardAction {
                     {
                         delete = true;
                     }
-                    if ui.add(tiny_button("复制引用", SUB)).clicked() {
-                        ui.ctx().copy_text(q.content.clone());
-                    }
                 });
             } else if let Some(url) = &row.link_url {
                 ui.add_space(2.0);
@@ -11645,11 +13693,6 @@ fn reference_card(ui: &mut egui::Ui, row: &MsgRow) -> ReferenceCardAction {
                 });
             }
 
-            ui.horizontal(|ui| {
-                if ui.add(tiny_button("复制本条", SUB)).clicked() {
-                    ui.ctx().copy_text(row.content.clone());
-                }
-            });
         });
     ReferenceCardAction { locate, delete }
 }
@@ -11992,6 +14035,77 @@ fn risk_first_color(row: &crate::risk::PanelRow) -> Color32 {
     zodiac_color(&row.key).unwrap_or(TEXT)
 }
 
+/// 吃码输入：非数 / 负数当 0，超过该号当前金额夹到金额（与参考项目一致）。
+fn code_report_reduce_of(map: &HashMap<u32, String>, num: u32, stake: f64) -> f64 {
+    let raw = map
+        .get(&num)
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    if raw <= 0.0 {
+        0.0
+    } else {
+        raw.min(stake.max(0.0))
+    }
+}
+
+/// 上报正文（不含首行「地区 特码」）：按金额降序分组，组内号码升序；
+/// 完整生肖合并成生肖名（如 `马蛇兔.8.1各91`）。
+fn code_report_detail(reduce: &[(u32, f64)]) -> String {
+    let mut groups: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+    for &(num, amount) in reduce {
+        let cents = (amount * 100.0).round() as i64;
+        groups.entry(cents).or_default().push(num);
+    }
+    groups
+        .iter()
+        .rev()
+        .map(|(cents, nums)| {
+            format_code_report_group(nums, *cents as f64 / 100.0)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 完整上报文本：首行 `澳 特码`，下面是正文。
+fn code_report_text(region: usize, reduce: &[(u32, f64)]) -> String {
+    let detail = code_report_detail(reduce);
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!("{} 特码\n{}", crate::risk::REGION_CHARS[region], detail)
+    }
+}
+
+fn format_code_report_group(nums: &[u32], amount: f64) -> String {
+    let mut nums: Vec<u32> = nums.to_vec();
+    nums.sort_unstable();
+    let set: BTreeSet<u32> = nums.iter().copied().collect();
+    let mut consumed: BTreeSet<u32> = BTreeSet::new();
+    let mut zodiacs = String::new();
+    for name in crate::settle::zodiac_names() {
+        let Some(z_nums) = crate::settle::zodiac_numbers(name) else {
+            continue;
+        };
+        if !z_nums.is_empty() && z_nums.iter().all(|n| set.contains(n)) {
+            zodiacs.push_str(name);
+            consumed.extend(z_nums);
+        }
+    }
+    let remaining: Vec<String> = nums
+        .iter()
+        .filter(|n| !consumed.contains(n))
+        .map(|n| n.to_string())
+        .collect();
+    let mut out = zodiacs;
+    if !remaining.is_empty() {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&remaining.join("."));
+    }
+    format!("{}各{}", out, crate::convert::fmt_amount(amount))
+}
+
 fn risk_col_widths(total: f32, list: crate::risk::PanelList) -> Vec<f32> {
     let fractions: &[f32] = match list {
         crate::risk::PanelList::Special => &[0.19, 0.33, 0.34, 0.14],
@@ -12143,6 +14257,25 @@ fn risk_stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, w
                     ui.label(RichText::new(value).size(16.0).strong().color(color));
                 });
             });
+        });
+}
+
+/// 授权弹窗的信息卡：标签在上、值在下。到期时间可能很长（「365天 12小时 35分钟」），
+/// 单行右对齐会顶到标签上并溢出卡片，所以这里给值单独一行，超出宽度就省略。
+fn auth_stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, width: f32) {
+    egui::Frame::new()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width((width - 20.0).max(20.0));
+            ui.label(RichText::new(label).size(11.0).color(MUTED));
+            ui.add(
+                egui::Label::new(RichText::new(value).size(15.0).strong().color(color))
+                    .truncate()
+                    .selectable(false),
+            );
         });
 }
 
@@ -13114,6 +15247,139 @@ fn find_quoted_image_index(
         }
     }
     best.map(|(_, i)| i)
+}
+
+/// 一条消息在「已撤回」名单里的身份：(sort, 会话, 发送人)。
+fn revoke_key_of(row: &MsgRow) -> crate::revoked::RevokeKey {
+    (row.sort, row.chat.clone(), row.sender.clone())
+}
+
+/// 一批消息里可以作为撤回目标的候选：撤回提示自身除外；**已撤回的原消息
+/// 仍然保留**。重新导入时原消息会被过滤掉不再显示，但撤回提示仍要能在
+/// 候选池里找到它，否则会退而匹配更早的同发送人消息，误记成新的「已撤回」。
+fn revoke_candidates(rows: &[MsgRow]) -> Vec<MsgRow> {
+    rows.iter()
+        .filter(|r| r.kind != "撤回")
+        .cloned()
+        .collect()
+}
+
+/// 从撤回提示里取撤回人昵称：`"张三" 撤回了一条消息` → `张三`。
+fn revoke_actor(content: &str) -> Option<String> {
+    let text = content.trim();
+    let idx = text
+        .find("撤回了一条消息")
+        .or_else(|| text.find("撤回了"))?;
+    let name = text[..idx]
+        .trim()
+        .trim_matches(|c: char| c.is_whitespace() || "\"'“”「」『』：:".contains(c))
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// 找被撤回的那一条：同会话、在撤回提示之前、发送人匹配，取最近一条。
+///
+/// 群聊按撤回提示里的昵称匹配；单聊按「不是自己」的那一方匹配；
+/// `你撤回了一条消息` 匹配自己。
+fn find_revoke_target(
+    revoke: &MsgRow,
+    orders: &[MsgRow],
+    batch: &[MsgRow],
+    self_wxid: &str,
+    name_to_usr: &HashMap<String, String>,
+) -> Option<MsgRow> {
+    let actor = revoke_actor(&revoke.content);
+    let is_group = revoke.chat.ends_with("@chatroom");
+    let mut best: Option<&MsgRow> = None;
+    for m in orders.iter().chain(batch.iter()) {
+        if m.chat != revoke.chat || m.sort >= revoke.sort {
+            continue;
+        }
+        if matches!(m.kind.as_str(), "撤回" | "系统") {
+            continue;
+        }
+        let actor_is_self = |name: &str| {
+            name == "你"
+                || (!self_wxid.is_empty()
+                    && name_to_usr.get(name).is_some_and(|usr| *usr == self_wxid))
+        };
+        let matches = match actor.as_deref() {
+            Some(name) => {
+                if actor_is_self(name) {
+                    !self_wxid.is_empty() && m.sender == self_wxid
+                } else if is_group {
+                    // 备注名 / 群昵称可能对不上：再用「显示名 → username」兜一次。
+                    m.nick == name
+                        || name_to_usr
+                            .get(name)
+                            .is_some_and(|usr| *usr == m.sender)
+                } else {
+                    !self_wxid.is_empty() && m.sender != self_wxid
+                }
+            }
+            None => !is_group && !self_wxid.is_empty() && m.sender != self_wxid,
+        };
+        if !matches {
+            continue;
+        }
+        if best.is_none_or(|b| m.sort > b.sort) {
+            best = Some(m);
+        }
+    }
+    best.cloned()
+}
+
+/// 在一组消息里找「被引用消息」。
+///
+/// 文字 / 链接按正文匹配；图片按发送人 + 时间；没有可读正文的类型（语音 /
+/// 视频 / 表情等）按「同会话 + 发送人 + 时间最近」兜底。
+fn find_quote_in_rows(rows: &[MsgRow], row: &MsgRow, quote: &QuoteRef) -> Option<MsgRow> {
+    if quote.msg_type == 3 {
+        if let Some(i) = find_quoted_image_index(rows, row, quote) {
+            return Some(rows[i].clone());
+        }
+    }
+    let quote_ms = quote.create_time.saturating_mul(1000);
+    let sender_matches = |o: &MsgRow| -> bool {
+        if !quote.from_usr.is_empty() && !quote.from_usr.ends_with("@chatroom") {
+            o.sender == quote.from_usr
+        } else if !quote.from.is_empty() {
+            o.nick == quote.from
+        } else {
+            true
+        }
+    };
+    let target = compact_text(quote.content.trim());
+    if target.is_empty() {
+        return rows
+            .iter()
+            .filter(|o| o.chat == row.chat && sender_matches(o))
+            .map(|o| ((o.sort - quote_ms).abs(), o))
+            .min_by_key(|(diff, _)| *diff)
+            .map(|(_, o)| o.clone());
+    }
+    let quote_time = if quote.create_time > 0 {
+        Local
+            .timestamp_opt(quote.create_time, 0)
+            .single()
+            .map(|t| format!("{}:{:02}", t.hour(), t.minute()))
+    } else {
+        None
+    };
+    let mut best: Option<(i32, usize)> = None;
+    for (i, order) in rows.iter().enumerate() {
+        let Some(score) = quote_match_score(order, &row.chat, quote, quote_time.as_deref()) else {
+            continue;
+        };
+        if best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, i));
+        }
+    }
+    best.map(|(_, i)| rows[i].clone())
 }
 
 fn quote_match_score(

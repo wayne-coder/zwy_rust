@@ -143,4 +143,7 @@ pub struct AppData {
     pub missing_avatars: usize,
     pub elapsed_ms: u128,
     pub key_source: String,
+    /// 本次读取是否从**正在运行的微信进程内存**里拿到了密钥。
+    /// true = 检测时微信确实处于登录状态（缓存路径不算）。
+    pub key_live: bool,
 }

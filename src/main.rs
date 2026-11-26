@@ -18,10 +18,12 @@ mod loader;
 mod locate;
 mod messages;
 mod model;
+mod ocr;
 mod odds;
 mod reconcile;
 mod reference;
 mod replacements;
+mod revoked;
 mod risk;
 mod settle;
 mod sqlite;
@@ -33,6 +35,9 @@ mod xiaoma_merge;
 mod xiaoma_offsets;
 
 use eframe::egui;
+
+// 由 build.rs 生成：有 assets/app.ico 或 assets/app.png 时返回窗口图标。
+include!(concat!(env!("OUT_DIR"), "/app_icon.rs"));
 
 /// GUI 子系统下 panic 信息看不到：同时写一份到临时目录，便于定位闪退。
 fn install_panic_log() {
@@ -112,11 +117,40 @@ fn main() -> eframe::Result {
         }
     }
 
+    // 导出 OCR 识别字典：把当前关键词设置里的字符 + 数字符号写成一字一行的
+    // PaddleOCR 字典文件，供训练专属模型和推理共用。
+    if let Some(i) = argv.iter().position(|a| a == "--export-ocr-dict") {
+        let path = argv
+            .get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| "ppocr_keys.txt".to_string());
+        let text = ocr::dict_text(&keywords::load());
+        match std::fs::write(&path, &text) {
+            Ok(()) => {
+                println!("已导出 {} 个字符到 {path}", text.lines().count());
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("导出字典失败：{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1090.0, 780.0])
+        // 最小宽度要能同时放下：成员条 72 + 注单消息 268 + 原文列 260 +
+        // 明细表格最小 380（含分隔线 / 边距），同时顶部工具栏的分组按钮
+        // 也不能互相遮挡——两者叠加后与默认宽度 1090 基本一致，再窄就会裁掉内容。
+        .with_min_inner_size([1090.0, 520.0])
+        // 标题栏图标右侧显示软件名与版本号。
+        .with_title(concat!("账无忧 v", env!("CARGO_PKG_VERSION")));
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 780.0])
-            .with_min_inner_size([760.0, 520.0])
-            .with_title("账无忧"),
+        viewport,
         ..Default::default()
     };
 

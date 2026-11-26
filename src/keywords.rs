@@ -498,9 +498,10 @@ mod tests {
     #[test]
     fn default_uses_embedded_user_config() {
         let s = KeywordSettings::default();
-        // 当前配置相对源码默认值做过的调整：特码组多了「特」，金额后缀是「米」。
+        // 当前配置相对源码默认值做过的调整：特码组多了「特」，金额后缀是「米」「%」。
         assert!(s.get(Field::SpecialNumber).contains(&"特".to_string()));
         assert!(s.get(Field::StakeSuffix).contains(&"米".to_string()));
+        assert!(s.get(Field::StakeSuffix).contains(&"%".to_string()));
         assert!(!s.get(Field::StakeSuffix).contains(&"只".to_string()));
         assert!(s.get(Field::TotalStake).contains(&"=".to_string()));
         assert!(!s.get(Field::StakePrefix).contains(&"=".to_string()));

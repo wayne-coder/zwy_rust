@@ -8,3 +8,7 @@ rule	X	拖
 rule	✕	拖
 rule	x	拖
 rule	Ⅹ	拖
+rule	三🀄️三	三中三
+rule	二🀄️二	二中二
+rule	×	拖
+rule	✖	拖

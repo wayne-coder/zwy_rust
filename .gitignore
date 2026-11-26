@@ -2,3 +2,10 @@
 /tmp
 /tools/msys64
 /*.exe
+/samples
+/training/train_data
+/training/output
+/training/pretrain_models
+/training/inference
+/training/*.onnx
+/training/*.traineddata

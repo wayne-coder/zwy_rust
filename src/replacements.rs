@@ -177,5 +177,9 @@ mod tests {
         assert!(rules.contains(&("X".to_string(), "拖".to_string())));
         assert!(rules.contains(&("复试".to_string(), "复式".to_string())));
         assert!(rules.contains(&("三三".to_string(), "三中三".to_string())));
+        // 当前配置里带 emoji 的写法，以及更多拖 / 乘号写法。
+        assert!(rules.contains(&("三🀄️三".to_string(), "三中三".to_string())));
+        assert!(rules.contains(&("二🀄️二".to_string(), "二中二".to_string())));
+        assert!(rules.contains(&("×".to_string(), "拖".to_string())));
     }
 }

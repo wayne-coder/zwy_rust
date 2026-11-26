@@ -73,7 +73,6 @@ pub struct StateView {
     /// 「365天 12小时 35分钟」/「永不过期」/「已过期」
     pub remaining_text: String,
     pub note: String,
-    pub server_url: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,10 +121,6 @@ impl Auth {
         }
     }
 
-    pub fn server_url(&self) -> &str {
-        &self.server_url
-    }
-
     pub fn authenticated(&self) -> bool {
         let s = self.shared.lock().unwrap();
         if s.token.is_empty() {
@@ -140,17 +135,13 @@ impl Auth {
     pub fn state(&self) -> StateView {
         let s = self.shared.lock().unwrap();
         if s.token.is_empty() || s.account.is_none() {
-            return StateView {
-                server_url: self.server_url.clone(),
-                ..Default::default()
-            };
+            return StateView::default();
         }
         let a = s.account.as_ref().unwrap();
         StateView {
             username: a.username.clone(),
             remaining_text: remaining_text_of(a.expires_at),
             note: a.note.clone(),
-            server_url: self.server_url.clone(),
         }
     }
 

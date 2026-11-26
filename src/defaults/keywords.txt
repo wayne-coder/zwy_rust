@@ -117,6 +117,7 @@ kw	perGroupTotalStake	包
 kw	stakeSuffix	元
 kw	stakeSuffix	块
 kw	stakeSuffix	米
+kw	stakeSuffix	%
 kw	multiLineStakePrefix	A
 kw	multiLineStakePrefix	a
 kw	hongKong	港

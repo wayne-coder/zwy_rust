@@ -82,6 +82,39 @@ pub struct PanelColumn {
     pub rows: Vec<PanelRow>,
 }
 
+/// 把「特码吃码」减额（正 = 减额）应用到特码列：
+/// 区头总额 / 回水、该列每个号的金额与风险一起变。
+///
+/// 吃码后风险按整区口径重算：`新总额 − 新总额 × 回水% − (原金额 − 本号吃码) × 赔率`。
+pub fn apply_special_offsets(
+    col: &mut PanelColumn,
+    region: usize,
+    reduce_by_num: &BTreeMap<u32, f64>,
+    odds: &OddsConfig,
+    odds_group: Option<&str>,
+) {
+    if reduce_by_num.is_empty() {
+        return;
+    }
+    let set = odds_of(odds, odds_group, region);
+    let multiplier = set.value("special_number");
+    let rebate = set.value("rw_special_number") / 100.0;
+    let total_reduce: f64 = reduce_by_num.values().sum();
+    let new_total = col.total_stake - total_reduce;
+    let new_water = new_total * rebate;
+    col.total_stake = new_total;
+    col.total_water = new_water;
+    let base = new_total - new_water;
+    for row in &mut col.rows {
+        let Some(num) = row.num else {
+            continue;
+        };
+        let reduce = reduce_by_num.get(&num).copied().unwrap_or(0.0);
+        row.stake -= reduce;
+        row.risk = base - row.stake * multiplier;
+    }
+}
+
 /// 三栏投注表。`lian_size` 只对连肖的**行**生效，区头合计始终按全部规格算。
 pub fn panel(
     list: PanelList,
@@ -896,6 +929,43 @@ mod tests {
         let stats = play_stats(&bets, None, "拖");
         assert_eq!(stats[0].distinct, 4);
         assert_eq!(stats[0].total_bets, 4);
+    }
+
+    #[test]
+    fn special_offsets_reduce_total_and_risk() {
+        let odds = OddsConfig::default();
+        let mut col = PanelColumn {
+            total_stake: 1000.0,
+            total_water: 40.0, // 特码回水默认 4%
+            rows: (1..=49u32)
+                .map(|n| PanelRow {
+                    key: num_key(n),
+                    label: num_label(n),
+                    stake: match n {
+                        1 => 100.0,
+                        2 => 50.0,
+                        _ => 0.0,
+                    },
+                    risk: 0.0,
+                    hit: false,
+                    num: Some(n),
+                })
+                .collect(),
+        };
+        let mut reduce: BTreeMap<u32, f64> = BTreeMap::new();
+        reduce.insert(1, 50.0);
+        apply_special_offsets(&mut col, 0, &reduce, &odds, None);
+
+        assert!((col.total_stake - 950.0).abs() < 1e-9);
+        assert!((col.total_water - 950.0 * 0.04).abs() < 1e-9);
+        let base = 950.0 - 950.0 * 0.04;
+        let row1 = col.rows.iter().find(|r| r.num == Some(1)).unwrap();
+        let row2 = col.rows.iter().find(|r| r.num == Some(2)).unwrap();
+        assert!((row1.stake - 50.0).abs() < 1e-9);
+        assert!((row1.risk - (base - 50.0 * 47.0)).abs() < 1e-9);
+        // 没吃码的号：金额不变，但整区总额变小 → 风险跟着变。
+        assert!((row2.stake - 50.0).abs() < 1e-9);
+        assert!((row2.risk - (base - 50.0 * 47.0)).abs() < 1e-9);
     }
 
     #[test]
