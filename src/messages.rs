@@ -220,8 +220,37 @@ fn collect(
                 let ts = r.int(2);
                 let content_bytes = r.bytes(3);
                 let compress = r.bytes(4);
-                let (kind, content, link_url, quote) =
+                let (kind, content, link_url, quote, revoke_msgid) =
                     decode_message(mtype, &content_bytes, &compress);
+                // 撤回提示：用 `newmsgid` 精确查出被撤回原消息的 sort。
+                // 旧库没有 server_id 列时查询失败，保持 None 退回原来的匹配方式。
+                let revoke_target = revoke_msgid.and_then(|msgid| {
+                    // 原消息一定在撤回提示之前，微信撤回窗口只有两分钟；
+                    // 加时间范围既走 create_time 索引，也避免匹配到同 id 的怪数据。
+                    let since = ts.saturating_sub(600);
+                    let sql = format!(
+                        "SELECT sort_seq, create_time FROM \"{table}\" \
+                         WHERE server_id = {msgid} AND create_time BETWEEN {since} AND {ts} LIMIT 1"
+                    );
+                    // 旧库没有 server_id 列 → 查询失败 → None（退回原匹配方式）；
+                    // 查询成功但找不到 → Some(0)（有 id 也不许再猜别的消息）。
+                    match conn.query(&sql) {
+                        Err(_) => None,
+                        Ok(rows) => Some(
+                            rows.first()
+                                .map(|r| {
+                                    let sort_seq = r.int(0);
+                                    if sort_seq > 0 {
+                                        sort_seq
+                                    } else {
+                                        r.int(1).saturating_mul(1000)
+                                    }
+                                })
+                                .filter(|s| *s > 0)
+                                .unwrap_or(0),
+                        ),
+                    }
+                });
                 // 撤回提示是系统消息（发送人为空），不属于任何分组成员；
                 // 它也不再进引用列表（用户 2026-11-25），按普通消息的成员过滤丢掉。
                 if let Some(f) = filter {
@@ -262,6 +291,7 @@ fn collect(
                     sender: sender.clone(),
                     link_url,
                     quote,
+                    revoke_target,
                 });
             }
         }
@@ -440,7 +470,7 @@ fn decode_message(
     mtype: i64,
     content: &[u8],
     compress: &[u8],
-) -> (String, String, Option<String>, Option<QuoteRef>) {
+) -> (String, String, Option<String>, Option<QuoteRef>, Option<i64>) {
     let (mut kind, fallback) = kind_of(mtype);
     let mut text = match kind.as_str() {
         "文字" | "系统" | "链接" | "其他" | "红包" => {
@@ -462,6 +492,9 @@ fn decode_message(
     };
     let mut link_url = None;
     let mut quote = None;
+    // 撤回提示里 `newmsgid` 指向被撤回原消息的服务端 id；能精确匹配时
+    // 就不再靠「同发送人最近一条」猜，避免把没撤回的消息误记成已撤回。
+    let mut revoke_msgid: Option<i64> = None;
 
     if kind == "链接" && !text.is_empty() {
         // 链接与「引用」都走 appmsg（type 49）。引用消息的 <type>57</type>
@@ -493,8 +526,13 @@ fn decode_message(
         || (system_like && text.contains("撤回了一条消息"))
     {
         kind = "撤回".to_string();
-        text = extract_tag(&text, "content")
-            .or_else(|| extract_tag(&text, "replacemsg"))
+        // 有些库把 sysmsg 存成转义后的文本（`&lt;newmsgid&gt;`），先还原再取标签。
+        let xml = text.replace("&lt;", "<").replace("&gt;", ">");
+        revoke_msgid = extract_tag(&xml, "newmsgid")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0);
+        text = extract_tag(&xml, "content")
+            .or_else(|| extract_tag(&xml, "replacemsg"))
             .unwrap_or_else(|| "撤回了一条消息".to_string());
         text = strip_sender_prefix(&text);
     }
@@ -505,7 +543,7 @@ fn decode_message(
             text = fallback.to_string();
         }
     }
-    (kind, text, link_url, quote)
+    (kind, text, link_url, quote, revoke_msgid)
 }
 
 /// 解析「引用」消息里的 `<refermsg>`：被引用正文、发送人、时间。
@@ -722,7 +760,7 @@ mod tests {
     #[test]
     fn quote_message_is_parsed_and_classified() {
         let xml = "<msg><appmsg><title>收到，跟一手</title><type>57</type>                   <refermsg><type>1</type><fromusr>wxid_a</fromusr>                   <displayname>张三</displayname><content>三中三 01,02,03 各10</content>                   <createtime>1700000000</createtime></refermsg></appmsg></msg>";
-        let (kind, text, url, quote) = decode_message(49, xml.as_bytes(), &[]);
+        let (kind, text, url, quote, _) = decode_message(49, xml.as_bytes(), &[]);
         assert_eq!(kind, "引用");
         assert_eq!(text, "收到，跟一手");
         assert!(url.is_none());
@@ -745,7 +783,7 @@ mod tests {
                    <fromusr>123@chatroom</fromusr>\
                    <chatusr>wxid_member</chatusr>\
                    <type>3</type></refermsg></appmsg></msg>";
-        let (kind, _, _, quote) = decode_message(49, xml.as_bytes(), &[]);
+        let (kind, _, _, quote, _) = decode_message(49, xml.as_bytes(), &[]);
         assert_eq!(kind, "引用");
         let quote = quote.expect("quote");
         assert_eq!(quote.msg_type, 3);
@@ -758,7 +796,7 @@ mod tests {
     #[test]
     fn normal_link_message_keeps_url() {
         let xml = "<msg><appmsg><title>下注说明</title><type>5</type>                   <url>https://example.com/bet</url></appmsg></msg>";
-        let (kind, text, url, quote) = decode_message(49, xml.as_bytes(), &[]);
+        let (kind, text, url, quote, _) = decode_message(49, xml.as_bytes(), &[]);
         assert_eq!(kind, "链接");
         assert_eq!(text, "下注说明");
         assert_eq!(url.as_deref(), Some("https://example.com/bet"));
@@ -775,17 +813,20 @@ mod tests {
     fn revoke_system_message_is_classified() {
         let xml = "<?xml version=\"1.0\"?><sysmsg type=\"revokemsg\"><revokemsg>\
                    <content>\"一羊迁徙\" 撤回了一条消息</content>\
+                   <newmsgid>7380000000000000123</newmsgid>\
                    <revoketime>0</revoketime></revokemsg></sysmsg>";
-        let (kind, text, url, quote) = decode_message(10000, xml.as_bytes(), &[]);
+        let (kind, text, url, quote, msgid) = decode_message(10000, xml.as_bytes(), &[]);
         assert_eq!(kind, "撤回");
         assert_eq!(text, "\"一羊迁徙\" 撤回了一条消息");
         assert!(url.is_none());
         assert!(quote.is_none());
+        assert_eq!(msgid, Some(7380000000000000123));
 
-        // 10002 的纯文本撤回提示也能识别。
-        let (kind, text, _, _) =
+        // 10002 的纯文本撤回提示也能识别（没有 newmsgid）。
+        let (kind, text, _, _, msgid) =
             decode_message(10002, "wxid_x:\n\"程程\" 撤回了一条消息".as_bytes(), &[]);
         assert_eq!(kind, "撤回");
         assert!(text.contains("撤回了一条消息"), "{text}");
+        assert_eq!(msgid, None);
     }
 }

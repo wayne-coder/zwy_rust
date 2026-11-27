@@ -206,6 +206,40 @@ fn strip_stake_suffix_word<'a>(s: &'a str, settings: &KeywordSettings) -> &'a st
     best
 }
 
+/// 单个字符是不是金额后缀词（`元 / 块 / 米 / %`…）。
+fn is_stake_suffix_char(c: char, settings: &KeywordSettings) -> bool {
+    matches!(c, '元' | '块')
+        || settings
+            .get(Field::StakeSuffix)
+            .iter()
+            .any(|kw| kw.chars().count() == 1 && kw.starts_with(c))
+}
+
+/// 金额后缀后面是否紧跟下一组号码：中间允许一个号码分隔符
+/// （`…10块.4.14…` 的点号是组间分隔，不是小数）。
+fn suffix_followed_by_numbers(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return true;
+    }
+    if !matches!(
+        first,
+        '.' | '．' | ',' | '，' | '、' | '+' | '＋' | '/' | '／' | '|' | '｜' | ';' | '；'
+    ) {
+        return false;
+    }
+    chars
+        .as_str()
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|n| n.is_ascii_digit())
+}
+
 /// 「号码 + 金额」对子的判据：左号码 1–49，右金额 > 0。
 /// 斜杠（`/`、`／`）后面的数字一律是金额；点号（`.`、`．`）沿用老口径，
 /// 只有大于 49 才像金额（点号本来就常用来分隔号码）。
@@ -255,9 +289,21 @@ fn pure_segment_stake(
     settings: &KeywordSettings,
     allow_bare_tail: bool,
 ) -> Option<Stake> {
-    let seg = seg.trim_matches(|c: char| c.is_whitespace() || is_separator(c));
+    let mut seg = seg.trim_matches(|c: char| c.is_whitespace() || is_separator(c));
     if seg.is_empty() {
         return None;
+    }
+    // `复式 / 复试` 修饰的是后面那个玩法（`三中三50，复式二中二…`），
+    // 剪掉后再判断这一段是不是「只有一个金额」。
+    let trimmed = seg.trim_end();
+    if let Some(rest) = trimmed
+        .strip_suffix("复式")
+        .or_else(|| trimmed.strip_suffix("复试"))
+    {
+        seg = rest.trim_matches(|c: char| c.is_whitespace() || is_separator(c));
+        if seg.is_empty() {
+            return None;
+        }
     }
     let (hits, cleaned) = extract_stakes(seg, settings, &[], true);
     if hits.len() != 1 {
@@ -830,8 +876,9 @@ fn prefix_is_picks(prefix: &str) -> bool {
 ///   明显占优（次数至少是「。」的两倍）才当分块符，否则按号码间隔处理；
 /// - 点号 / 分号只有「前面是数字、后面不是数字」且前面这一块已经写了金额时
 ///   才当分块符，避免把 `01.02`、`15/.20`、`21.22.23.三中三1` 这种号码写法拆开；
-/// - 逗号 / 顿号只在「前一块已完整（有号码且有金额）」且「后一块以玩法 / 地区开头」
-///   时切分，避免把 `三中三，二中二` 这种多玩法写法拆散。
+/// - 逗号 / 顿号只在「前一块已完整（有号码且有金额）」且「后一块以玩法 / 地区开头、
+///   且自己带号码」时切分，避免把 `三中三，二中二` 这种多玩法写法拆散，也避免把
+///   `二中二10+20各5，三中三各5，特碰各5` 里属于前一组号码的追加玩法拆到下组去。
 fn split_note_blocks(
     s: &str,
     num_sep: Option<char>,
@@ -842,8 +889,24 @@ fn split_note_blocks(
     let mut out: Vec<String> = Vec::new();
     let mut start = 0;
     for (i, &(pos, c)) in chars.iter().enumerate() {
+        // 金额后缀（`元 / 块 / 米`…）后面直接接下一组号码：后缀归前一笔，
+        // 在它后面断开。`三中三3+31+29=15元20+10+23=10元` → 两行。
+        if is_stake_suffix_char(c, settings) {
+            let cut = pos + c.len_utf8();
+            let left = &s[start..cut];
+            if line_has_picks(left, settings)
+                && line_has_explicit_stake(left, settings)
+                && suffix_followed_by_numbers(&s[cut..])
+            {
+                out.push(left.to_string());
+                start = cut;
+                continue;
+            }
+        }
         let split = match c {
             BLOCK_SEP => true,
+            // 感叹号是用户常用的「这一注写完了」标记，直接按备注分块。
+            '！' | '!' => true,
             '。' => {
                 if !separates_digits(&chars, i) {
                     true
@@ -870,10 +933,29 @@ fn split_note_blocks(
             '，' | '、' | ',' => {
                 let left = &s[start..pos];
                 let right = &s[pos + c.len_utf8()..];
-                !separates_digits(&chars, i)
-                    && line_has_picks(left, settings)
+                // 逗号后面先看第一个子块：只有它自己带号码（`二中二14+45+36各5`）
+                // 才是下一笔的开头；如果只是「只写玩法 + 金额」（`三中三各5`、
+                // `三中三5`），它是对前面号码的追加玩法
+                // （`二中二10+20各5，三中三各5，特碰各5`），不能拆到后面那组号码上。
+                let mut segs = right.split(['，', '、', ',']);
+                let right_head = segs.next().unwrap_or(right);
+                let head_decl = parse_decl_line(right_head, settings);
+                // `复试三星，13x14x20x39=120米`：只写玩法、没写金额，后面紧跟
+                // 一组没有自己玩法的号码 —— 这是给后面号码的玩法头，要在这里断开。
+                // 带金额的（`三中三各5`）则是前一组号码的追加玩法，不能拆开。
+                let head_heads_numbers = head_decl.as_ref().is_some_and(|plays| {
+                    plays.iter().all(|p| p.amount.is_none())
+                }) && segs.find(|seg| !seg.trim().is_empty()).is_some_and(|seg| {
+                    line_has_picks(seg, settings)
+                        && find_play_hits(seg, settings).is_empty()
+                });
+                // 不要求逗号两侧不是数字：`三中三各6， 10，11，35，三中三各5`
+                // 里前一块已完整，后面这组号码会带自己的玩法，必须在这里断开。
+                // 纯号码列表（`10，35，39`）左边没有金额，本来就不会切。
+                line_has_picks(left, settings)
                     && line_has_explicit_stake(left, settings)
                     && starts_with_note_head(right, settings)
+                    && (head_decl.is_none() || head_heads_numbers)
             }
             _ => false,
         };
@@ -1019,6 +1101,116 @@ fn mark_lian_stake(line: &str, settings: &KeywordSettings) -> String {
         }
     }
     out
+}
+
+/// 文本里所有玩法关键词的实际出现位置（字节区间），不按玩法类别去重。
+fn play_keyword_spans(text: &str, settings: &KeywordSettings) -> Vec<(usize, usize)> {
+    let mut kws: Vec<&str> = Vec::new();
+    for g in crate::keywords::groups() {
+        if g.section == Section::Play {
+            kws.extend(settings.get(g.field).iter().map(String::as_str));
+        }
+    }
+    // 固定短写法「特」= 特码。
+    kws.push("特");
+    let mut spans = Vec::new();
+    for kw in kws {
+        if kw.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(kw) {
+            let s = from + rel;
+            let e = s + kw.len();
+            spans.push((s, e));
+            // 允许重叠，往后挪一个字符继续找（`二中二` 这类词本身不会自重叠）。
+            from = s + text[s..].chars().next().map(char::len_utf8).unwrap_or(1);
+        }
+    }
+    spans
+}
+
+/// 手写时「十」常被当作加号：`三中三3十31十29` = `3+31+29`。
+///
+/// 只处理夹在阿拉伯数字之间的独立「十」；玩法词里的（`十不中`、`十连肖`）、
+/// 中文数字（`十五`、`三十`）和「十尾 / 十头」都不动。
+fn mark_plus_ten(line: &str, settings: &KeywordSettings) -> String {
+    let play_spans = play_keyword_spans(line, settings);
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let mut out = String::with_capacity(line.len());
+    for (i, &(pos, c)) in chars.iter().enumerate() {
+        let end = chars.get(i + 1).map(|(p, _)| *p).unwrap_or(line.len());
+        let prev_digit = chars[..i]
+            .iter()
+            .rev()
+            .map(|(_, ch)| *ch)
+            .find(|ch| !ch.is_whitespace())
+            .is_some_and(|ch| ch.is_ascii_digit());
+        if c == '十'
+            && !play_spans.iter().any(|(s, e)| pos >= *s && pos < *e)
+            && prev_digit
+            && next_is_amount_digits(&chars, i)
+        {
+            out.push('+');
+        } else {
+            out.push_str(line.get(pos..end).unwrap_or(""));
+        }
+    }
+    out
+}
+
+/// 有人手写时把「二」当等号写在金额前（`三中三19.24.46二10`、`13x14x20x39二120米`），
+/// 把这个独立的「二」换成配置里的总额符号「=」，后续金额识别就能按显式金额处理。
+///
+/// 不动这几种「二」：
+/// - 玩法词里的（`二中二`、`三中二`、`二连肖`）；
+/// - 更长中文数字的一部分（`十二`、`二十`）；
+/// - 后面跟着「尾 / 头」的（`二10尾` 是号码写法）。
+fn mark_equals_two(line: &str, settings: &KeywordSettings) -> String {
+    // 不能用 `find_play_hits`：它每类玩法每行只取一处，而 `二中二…，二中二…`
+    // 同一行可能出现多次，第二次的尾字「二」会被误当等号。
+    let play_spans = play_keyword_spans(line, settings);
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let mut out = String::with_capacity(line.len());
+    for (i, &(pos, c)) in chars.iter().enumerate() {
+        let end = chars
+            .get(i + 1)
+            .map(|(p, _)| *p)
+            .unwrap_or(line.len());
+        let in_play = play_spans
+            .iter()
+            .any(|(s, e)| pos >= *s && pos < *e);
+        // `十二` / `一百二十` 里的「二」是中文数字的一部分，不能换成等号。
+        // 只看紧挨着的连续中文数字个数：`三中三二10` 里「二」前面只有一个「三」，
+        // 那是玩法词的尾字，仍按等号处理。
+        let mut cn_run = 0usize;
+        let mut k = i;
+        while k > 0 && is_cn_num_char(chars[k - 1].1) {
+            cn_run += 1;
+            k -= 1;
+        }
+        if c == '二' && !in_play && cn_run < 2 && next_is_amount_digits(&chars, i) {
+            out.push('=');
+        } else {
+            out.push_str(line.get(pos..end).unwrap_or(""));
+        }
+    }
+    out
+}
+
+/// `二` 后面（允许空白）是阿拉伯数字，且数字不是「尾 / 头」分组词。
+fn next_is_amount_digits(chars: &[(usize, char)], i: usize) -> bool {
+    let mut j = i + 1;
+    while j < chars.len() && chars[j].1.is_whitespace() {
+        j += 1;
+    }
+    if j >= chars.len() || !chars[j].1.is_ascii_digit() {
+        return false;
+    }
+    while j < chars.len() && chars[j].1.is_ascii_digit() {
+        j += 1;
+    }
+    !(j < chars.len() && matches!(chars[j].1, '尾' | '头'))
 }
 
 /// 预先处理原文：应用替换词、组数说明、组分隔符；按推测出的备注分块符切块；
@@ -1185,14 +1377,36 @@ fn count_line_numbers(line: &str, settings: &KeywordSettings) -> usize {
     let hits = find_play_hits(&without_region, settings);
     let (_, cleaned) = extract_stakes(&without_region, settings, &hits, false);
     let picks = strip_all_play_keywords(&cleaned, settings);
-    number_runs(&picks)
-        .into_iter()
-        .filter(|(_, end, value, _)| {
-            (1.0..=49.0).contains(value)
-                && !picks[*end..].starts_with('尾')
-                && !picks[*end..].starts_with('头')
-        })
-        .count()
+    // `number_runs` 会把 `19.43` 当成一个小数（金额允许 `8.5` 这类写法），
+    // 但号码串里的 `.` 是号码分隔符，必须按整数逐个计数，否则
+    // `三中三19.43拖10.34拖9.21` 会被误判成「三个号码 + 两个拖」。
+    let mut count = 0;
+    let mut it = picks.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+        let start = i;
+        let mut end = i + c.len_utf8();
+        while let Some(&(j, d)) = it.peek() {
+            if d.is_ascii_digit() {
+                end = j + d.len_utf8();
+                it.next();
+            } else {
+                break;
+            }
+        }
+        let Ok(value) = picks[start..end].parse::<f64>() else {
+            continue;
+        };
+        if (1.0..=49.0).contains(&value)
+            && !picks[end..].starts_with('尾')
+            && !picks[end..].starts_with('头')
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// 一段里「多个裸表达式 + 末尾的玩法/金额声明」发散展开。
@@ -1368,6 +1582,9 @@ fn prepare_lines(
             if cleaned.trim().is_empty() {
                 continue;
             }
+            // 手写的「十」「二」当加号 / 等号用：`3十31二10` → `3+31=10`。
+            let cleaned = mark_plus_ten(&cleaned, settings);
+            let cleaned = mark_equals_two(&cleaned, settings);
             // 连肖 / 连尾紧贴的裸数字是每注金额（`四冲10共50` → `四冲各10共50`）。
             let cleaned = mark_lian_stake(&cleaned, settings);
             // `---` 是两笔注单的分隔符，先换成内部占位符，避免被当成号码间隔。
@@ -1534,6 +1751,16 @@ fn trailing_play_stake(line: &str, settings: &KeywordSettings) -> Option<Stake> 
         return None;
     }
     stakes.last().map(|s| s.stake)
+}
+
+/// 段落后面那行「玩法头」自己写的显式金额（`45三中三各5` 的 5）。
+/// 前面的号码行只写号码、继承这行玩法时，金额也跟着它走。
+fn header_play_stake(line: &str, settings: &KeywordSettings) -> Option<Stake> {
+    let expanded = expand_ranges(line, settings);
+    let (without_region, _) = strip_regions(&expanded, settings);
+    let hits = find_play_hits(&without_region, settings);
+    let (stakes, _) = extract_stakes(&without_region, settings, &hits, false);
+    stakes.last().map(|h| h.stake)
 }
 
 fn find_paragraph_stake(lines: &[&str], settings: &KeywordSettings) -> Option<Stake> {
@@ -1801,6 +2028,9 @@ pub fn convert_with_replacements(
     let mut paragraph_has_complete_line = false;
     // 本段是否已经出现过玩法（头行或本行），供号码行写金额时判定三要素。
     let mut paragraph_has_play = false;
+    // 本段出现过的所有玩法名。号码行没写玩法时，若本段不止一种玩法，
+    // 就无法确定该行属于哪个玩法，要交人工复核（不能默默沿用上一行）。
+    let mut paragraph_play_names: BTreeSet<String> = BTreeSet::new();
     // 本段向后找到的玩法头（用于号码行在前、玩法行在后的写法）及其行下标。
     // 注意：带自己金额的号码行不向后继承这个玩法，会按默认特码处理。
     let mut paragraph_play: Option<(String, PlayKind, bool)> = None;
@@ -1859,6 +2089,7 @@ pub fn convert_with_replacements(
             paragraph_play_no_amount = false;
             paragraph_has_complete_line = false;
             paragraph_has_play = false;
+            paragraph_play_names.clear();
             paragraph_play = None;
             paragraph_play_header = None;
             paragraph_start = true;
@@ -1911,6 +2142,9 @@ pub fn convert_with_replacements(
         }
         if !type_hits.is_empty() {
             paragraph_has_play = true;
+            for h in &type_hits {
+                paragraph_play_names.insert(h.name.to_string());
+            }
         }
 
         // `A10` 这种多行金额前缀：本行和后面几行都先用它，直到遇到新的金额。
@@ -1923,12 +2157,20 @@ pub fn convert_with_replacements(
         // 即使不大于 49，也不受段里别处写的金额影响。
         let slash_pair =
             paragraph_only_special && is_slash_amount_pair_line(&without_region, settings);
+        // 本行还没写玩法、玩法头在它后面：行末裸数字优先当号码，不能猜成金额。
+        // 例如三行号码「11、27、43」+ 末尾「三中三各5」，43 是第三个号码；
+        // 猜成金额会让这行少一个号、还被误判成特码。只有显式金额词（各 / 每组 /
+        // 元 / A…）才算本行自己写了金额。
+        let inherits_later_play = type_hits.is_empty()
+            && paragraph_play.is_some()
+            && paragraph_play_header.is_some_and(|header| line_idx < header);
         // 段落里已经有单独的金额行（或共享金额）时，行末裸数字不再猜成金额（它们是号码）。
         let (stake_hits, stake_cleaned) = extract_stakes(
             &without_region,
             settings,
             &type_hits,
-            (paragraph_stake.is_none() && shared_stake.is_none() && multi_stake.is_none())
+            ((paragraph_stake.is_none() && shared_stake.is_none() && multi_stake.is_none())
+                && !inherits_later_play)
                 || trailing_number_over_49(&without_region)
                 || line_has_only_trailing_amount(&without_region, settings)
                 || trailing_amount_completes_combo(&without_region, settings)
@@ -1940,10 +2182,12 @@ pub fn convert_with_replacements(
                         settings,
                     )),
         );
-        // 本行自己写了金额、而玩法头在它后面时，不向后继承那个玩法：
+        // 本行自己写了**显式**金额、而玩法头在它后面时，不向后继承那个玩法：
         // 按默认特码处理，让「同注单混玩法」规则提示人工复核。
-        // 没写金额的行仍然可以继承后面的玩法（给「号码在前、玩法在后」用）。
-        let own_amount = !stake_hits.is_empty();
+        // 行末裸数字猜出来的金额不算「写了金额」；没写金额的行仍可继承后面的玩法。
+        let own_amount = stake_hits
+            .iter()
+            .any(|h| !matches!(h.stake.kind, StakeKind::Guessed));
         if type_hits.is_empty() {
             if let Some((name, kind, union)) = &paragraph_play {
                 if paragraph_play_header.is_some_and(|header| line_idx < header) {
@@ -1962,7 +2206,19 @@ pub fn convert_with_replacements(
         }
 
         // 先取「本行之前」的段落金额，再用本行自己的金额更新继承值。
-        let fallback_stake = paragraph_stake.or(shared_stake);
+        // 号码行在玩法头前面时，优先用玩法头自己写的金额（`三中三各5`）。
+        let header_stake = if inherits_later_play {
+            paragraph_play_header
+                .and_then(|h| prepared_refs.get(h))
+                .and_then(|l| header_play_stake(l, settings))
+        } else {
+            None
+        };
+        let fallback_stake = if inherits_later_play {
+            header_stake.or(shared_stake).or(paragraph_stake)
+        } else {
+            paragraph_stake.or(shared_stake)
+        };
         if let Some(h) = stake_hits.last() {
             // 对子自己的金额只属于这一行，不借给同段其它行。
             if !slash_pair {
@@ -1972,6 +2228,15 @@ pub fn convert_with_replacements(
         let content_text = strip_all_play_keywords(&stake_cleaned, settings);
         // 交集写法（`虎牛狗v双`）在金额摘掉之后展开成号码。
         let content_text = expand_intersections(&content_text, settings);
+
+        // 号码之间逗号和空格混用（`35，46，48，7，1 9`）：
+        // 空格处可能是漏写分隔符或两位数被拆开，交人工复核。
+        if mixed_number_separators(&content_text) {
+            out.doubtful = true;
+            out.reasons.push(format!(
+                "第 {line_no} 行：号码之间逗号和空格混用，请人工复核"
+            ));
+        }
 
         // `猪拖虎拖鼠各1`：拖注但整段都没写玩法，无法确定是二中二还是三中三。
         if type_hits.is_empty() && !paragraph_has_play {
@@ -2087,6 +2352,21 @@ pub fn convert_with_replacements(
                 }
             }
             continue;
+        }
+
+        // 号码行自己没写玩法，而本段出现过不止一种玩法：无法确定该行属于
+        // 哪个玩法（`4尾x8尾 各5` 夹在三中三 / 二中二之间），交人工复核。
+        // 段里有明确的多玩法头行时，号码行本来就按每个玩法各出一注，不算歧义。
+        if type_hits.is_empty()
+            && paragraph_plays.is_empty()
+            && paragraph_play_names.len() >= 2
+        {
+            out.doubtful = true;
+            let names: Vec<String> = paragraph_play_names.iter().cloned().collect();
+            out.reasons.push(format!(
+                "第 {line_no} 行：没写玩法，本段有多种玩法（{}），请人工确认",
+                names.join("、")
+            ));
         }
 
         // 这一行是否满足「玩法 + 号码 + 金额」三要素。玩法可以来自本段的
@@ -2260,7 +2540,7 @@ pub fn convert_with_replacements(
             // 用户已经明确写了「拖」：按分隔符拆组，每组内部排序、补零后原样输出。
             // 组数不够交给 validate_bets 报失败，不在这里吞掉。
             if let Some(drag_groups) =
-                explicit_drag_groups(&content_text, settings, &separator)
+                explicit_drag_groups(&content_text, settings)
             {
                 // 组数必须和每个玩法的组合大小一致，才是真正的拖注；
                 // 例如 X 被替换成「拖」后得到的 4 组号码，对二中二 / 三中三 /
@@ -2298,6 +2578,7 @@ pub fn convert_with_replacements(
                             &drag_groups,
                             (*type_stake).or(fallback_stake),
                             &separator,
+                            true,
                         );
                     }
                     continue;
@@ -2313,11 +2594,38 @@ pub fn convert_with_replacements(
         };
 
         if let Some(plan) = group_plan {
+            let separator = settings
+                .get(Field::Multiplication)
+                .iter()
+                .find(|k| !k.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "拖".to_string());
             // 多组：每组用自己的号码与金额；玩法沿用整行识别到的类型。
             for (content, group_stake) in &plan {
                 for (base_name, base_kind, type_stake) in &types {
                     // 组内没写金额时用整行/整段识别到的金额。
                     let stake = (*group_stake).or(*type_stake);
+                    // 逗号分隔的每一组本身又是相邻生肖 / 尾数时（`蛇猪鸡，虎鸡鼠，
+                    // 马鸡猪，三中三各1`），每组按「拖」输出；这里保留用户写的
+                    // 生肖写法，不再展开成号码，也不额外加括号。
+                    if let PlayKind::Combo(size) = base_kind {
+                        if !says_union {
+                            if let Some(drag_groups) = auto_drag_groups(content) {
+                                if drag_groups.len() == *size {
+                                    emit_drag_bet(
+                                        &mut out,
+                                        &regions_to_emit,
+                                        base_name,
+                                        &drag_groups,
+                                        stake,
+                                        &separator,
+                                        false,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     emit_bet(
                         &mut out,
                         &regions_to_emit,
@@ -3136,21 +3444,40 @@ fn useless_words(
     out
 }
 
-/// 原文里已经写了「拖」时，按乘法分隔符拆出每个分组。
+/// 原文里已经写了乘法分隔符时，按**设置里的全部分隔词**拆出每个分组。
+///
+/// 不能只认第一个「拖」：设置里还有「碰 / t / T」或用户自己加的符号，
+/// 只拆第一个会让其它符号被当成普通分隔符丢掉，拖注就「不生效」了。
 ///
 /// 每个分组去掉括号后走通用号码规范化（补零、去无效词），再把组内号码排序，
 /// 所以 `7-43-31拖4-28-40拖11-23-47-10-34` 会得到
 /// `["07,31,43", "04,28,40", "10,11,23,34,47"]`。
-fn explicit_drag_groups(
-    content: &str,
-    settings: &KeywordSettings,
-    separator: &str,
-) -> Option<Vec<String>> {
-    if separator.is_empty() || !content.contains(separator) {
+fn explicit_drag_groups(content: &str, settings: &KeywordSettings) -> Option<Vec<String>> {
+    let mut seps: Vec<&str> = settings
+        .get(Field::Multiplication)
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    // 多字分隔词优先，避免「拖拖」这类写法先被单字「拖」切开。
+    seps.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    seps.dedup();
+    if seps.is_empty() || !seps.iter().any(|s| content.contains(s)) {
         return None;
     }
+    let mut parts: Vec<String> = vec![content.to_string()];
+    for sep in seps {
+        parts = parts
+            .into_iter()
+            .flat_map(|part| {
+                part.split(sep)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
     let mut groups = Vec::new();
-    for part in content.split(separator) {
+    for part in parts {
         let part = part
             .trim()
             .trim_matches(['(', ')', '（', '）', '「', '」', '[', ']', '【', '】']);
@@ -3179,13 +3506,7 @@ fn sort_group_tokens(s: &str) -> String {
 /// 这种写法既可能是二中二（两组）也可能是三中三（三组），不能默认按特码算，
 /// 必须交人工确认。普通号码的拖注不在此列（`01拖02` 仍按特码理解）。
 fn bare_drag_groups(content: &str, settings: &KeywordSettings) -> Option<Vec<String>> {
-    let separator = settings
-        .get(Field::Multiplication)
-        .iter()
-        .find(|k| !k.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "拖".to_string());
-    let groups = explicit_drag_groups(content, settings, &separator)?;
+    let groups = explicit_drag_groups(content, settings)?;
     if !(2..=3).contains(&groups.len()) {
         return None;
     }
@@ -3370,7 +3691,7 @@ fn starts_with_chars(chars: &[char], word: &str) -> bool {
     chars.len() >= n && word.chars().zip(chars.iter().copied()).all(|(w, c)| w == c)
 }
 
-/// 输出一条「拖」注：括号包住每个分组，分组之间用乘法分隔符。
+/// 输出一条「拖」注：分组之间用乘法分隔符；`wrap` 为 true 时每个分组加括号。
 fn emit_drag_bet(
     out: &mut ConvertOutput,
     regions: &[Region],
@@ -3378,6 +3699,7 @@ fn emit_drag_bet(
     groups: &[String],
     stake: Option<Stake>,
     separator: &str,
+    wrap: bool,
 ) {
     // 每个拖注分组内部也去重：`(01,01,02)` 按两个号码算。
     let groups: Vec<String> = groups
@@ -3392,11 +3714,15 @@ fn emit_drag_bet(
         .collect();
     let drag_count = crate::settle::distinct_drag_count(&expanded).max(1.0);
     let drag_count = drag_count.max(1.0);
-    let display = groups
-        .iter()
-        .map(|g| format!("({g})"))
-        .collect::<Vec<_>>()
-        .join(separator);
+    let display = if wrap {
+        groups
+            .iter()
+            .map(|g| format!("({g})"))
+            .collect::<Vec<_>>()
+            .join(separator)
+    } else {
+        groups.join(separator)
+    };
 
     let stake_value = stake.unwrap_or(Stake {
         amount: 0.0,
@@ -3557,13 +3883,13 @@ fn emit_combo_groups(
 ) {
     if let PlayKind::Combo(size) = kind {
         if groups.len() == size {
-            emit_drag_bet(out, regions, name, groups, stake, separator);
+            emit_drag_bet(out, regions, name, groups, stake, separator, true);
             return;
         }
         if groups.len() < size {
             // 明确写了「拖」但分组不够：保留拖写法，交给校验报失败，
             // 不能悄悄变成复式。
-            emit_drag_bet(out, regions, name, groups, stake, separator);
+            emit_drag_bet(out, regions, name, groups, stake, separator, true);
             return;
         }
         // 分组多于档位：参考项目回退成复式号码池。
@@ -4392,7 +4718,8 @@ fn stake_suffix(after: &str, settings: &KeywordSettings) -> Option<usize> {
 
 fn is_line_end(s: &str) -> bool {
     s.chars().all(|c| {
-        c.is_whitespace() || "，。、；;,.!?！？()（）-－—–~～".contains(c)
+        // `#` / `＃` 是手写注单里常见的备注分隔符，`50#` 里的 50 仍算行末金额。
+        c.is_whitespace() || "，。、；;,.!?！？()（）-－—–~～#＃".contains(c)
     })
 }
 
@@ -4498,51 +4825,107 @@ fn cn_to_num(s: &str) -> Option<f64> {
 // ---------------- 内容 ----------------
 
 fn expand_ranges(s: &str, settings: &KeywordSettings) -> String {
-    let range_seps: Vec<char> = settings
+    let mut seps: Vec<Vec<char>> = settings
         .get(Field::Range)
         .iter()
-        .filter_map(|kw| {
-            let mut it = kw.chars();
-            let c = it.next()?;
-            it.next().is_none().then_some(c)
-        })
+        .map(|kw| kw.chars().collect::<Vec<_>>())
+        .filter(|kw| !kw.is_empty())
         .collect();
+    // 多字区间词优先（如用户把「至」改成「直到」）。
+    seps.sort_by(|a, b| b.len().cmp(&a.len()));
+
     let chars: Vec<char> = s.chars().collect();
+    let digits_at = |start: usize| -> Option<(u32, usize)> {
+        let mut end = start;
+        while end < chars.len() && chars[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        let n = chars[start..end].iter().collect::<String>().parse().ok()?;
+        Some((n, end))
+    };
+    let sep_at = |at: usize| -> Option<usize> {
+        seps
+            .iter()
+            .find(|sep| chars.get(at..at + sep.len()) == Some(sep.as_slice()))
+            .map(Vec::len)
+    };
+
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
-        if chars[i].is_ascii_digit() {
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            let a: Option<u32> = chars[start..i].iter().collect::<String>().parse().ok();
-            if let Some(a) = a {
-                if i + 1 < chars.len()
-                    && range_seps.contains(&chars[i])
-                    && chars[i + 1].is_ascii_digit()
-                {
-                    let mut j = i + 1;
-                    while j < chars.len() && chars[j].is_ascii_digit() {
-                        j += 1;
-                    }
-                    let b: Option<u32> = chars[i + 1..j].iter().collect::<String>().parse().ok();
-                    if let Some(b) = b {
-                        if a <= b && b - a <= 100 {
-                            let nums: Vec<String> =
-                                (a..=b).map(|n| n.to_string()).collect();
-                            out.push_str(&nums.join(","));
-                            i = j;
-                            continue;
+        if !chars[i].is_ascii_digit() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let Some((a, after_a)) = digits_at(start) else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        let cursor = after_a;
+
+        // 「1头至4头」「1尾至9尾」：两头单位必须一致。
+        if let Some(unit @ ('头' | '尾')) = chars.get(cursor).copied() {
+            let exp = sep_at(cursor + 1).and_then(|sep_len| {
+                let after_sep = cursor + 1 + sep_len;
+                let (b, after_b) = digits_at(after_sep)?;
+                (chars.get(after_b) == Some(&unit)).then_some((b, after_b))
+            });
+            if let Some((b, after_b)) = exp {
+                let limit = if unit == '头' { 4 } else { 9 };
+                if a <= b && b <= limit {
+                    let mut nums: Vec<u32> = Vec::new();
+                    for n in a..=b {
+                        if unit == '头' {
+                            nums.extend((n * 10).max(1)..=(n * 10 + 9).min(49));
+                        } else {
+                            nums.extend(
+                                (0..=4)
+                                    .map(|tens| tens * 10 + n)
+                                    .filter(|v| (1..=49).contains(v)),
+                            );
                         }
+                    }
+                    nums.sort_unstable();
+                    nums.dedup();
+                    if !nums.is_empty() {
+                        out.push_str(
+                            &nums
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                        i = after_b + 1;
+                        continue;
                     }
                 }
             }
-            out.extend(chars[start..i].iter());
-        } else {
-            out.push(chars[i]);
-            i += 1;
+            // 不展开：原样保留数字，单位与后面的内容交给下一轮处理。
+            out.extend(chars[start..cursor].iter());
+            i = cursor;
+            continue;
         }
+
+        // 普通号码区间：1至25。
+        if let Some(sep_len) = sep_at(cursor) {
+            let after_sep = cursor + sep_len;
+            if let Some((b, after_b)) = digits_at(after_sep) {
+                if a <= b && b - a <= 100 {
+                    let nums: Vec<String> = (a..=b).map(|n| n.to_string()).collect();
+                    out.push_str(&nums.join(","));
+                    i = after_b;
+                    continue;
+                }
+            }
+        }
+        out.extend(chars[start..cursor].iter());
+        i = cursor;
     }
     out
 }
@@ -4625,6 +5008,50 @@ fn normalize_content(s: &str) -> String {
 
     tokens.retain(|t| !is_noise_token(t));
     tokens.join(",")
+}
+
+/// 同一段连续号码里混用「逗号类」和「空格」分隔：
+/// `35，46，48，7，1 9` 里的 `1 9` 很可能是漏写分隔符，或两位数 `19` 被空格拆开，
+/// 应交人工复核。整段统一用空格（`1 2 3`）或统一用逗号（`1,2,3`）则不算混用。
+fn mixed_number_separators(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let is_sep = |c: char| {
+        matches!(
+            c,
+            '，' | '、' | ',' | '；' | ';' | '.' | '。' | '/' | '／' | '|' | '｜' | '+' | '＋'
+                | '-' | '－' | '—' | '–' | '~' | '～'
+        ) || c.is_whitespace()
+    };
+    let is_comma = |c: char| matches!(c, '，' | '、' | ',' | '；' | ';');
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // 一段连续号码：数字 + 号码分隔符（遇到生肖 / 文字就结束）。
+        let mut j = i;
+        while j < chars.len() && (chars[j].is_ascii_digit() || is_sep(chars[j])) {
+            j += 1;
+        }
+        let mut comma = false;
+        let mut space = false;
+        for k in (i + 1)..j.saturating_sub(1) {
+            if !chars[k - 1].is_ascii_digit() || !chars[k + 1].is_ascii_digit() {
+                continue;
+            }
+            if is_comma(chars[k]) {
+                comma = true;
+            } else if chars[k].is_whitespace() {
+                space = true;
+            }
+        }
+        if comma && space {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
 }
 
 fn is_separator(c: char) -> bool {
@@ -5012,6 +5439,245 @@ mod tests {
                 "澳 特碰 28,29,10,05 各组 3",
             ]
         );
+    }
+
+    #[test]
+    fn number_line_without_play_is_doubtful_when_paragraph_has_multiple_plays() {
+        // 第 5 行 `4尾x8尾 各5` 没写玩法，而本段同时有三中三和二中二，
+        // 不能默默沿用上一行的三中三。
+        let raw = "19.18.44.49三中三 二中二各5\n\
+                   29.39.48.18.24.44三中三 二中二 各2\n\
+                   08.18.28.38.48三中三 二中二各3\n\
+                   4尾x8尾x马 三中三 各1\n\
+                   4尾x8尾 各5\n\
+                   马x鼠x牛 三中三 各1\n\
+                   马x鼠 二中二各10";
+        let out = conv(raw);
+        assert!(out.doubtful, "{:?}", out.reasons);
+        assert!(
+            out.reasons
+                .iter()
+                .any(|r| r.contains("第 5 行") && r.contains("没写玩法")),
+            "{:?}",
+            out.reasons
+        );
+
+        // 整段只有一种玩法时，号码行没写玩法仍可安全继承，不报存疑。
+        let out = conv("三中三 1,2,3各5\n4,5,6各5");
+        assert!(!out.doubtful, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn each_play_keeps_its_own_amount_before_fu_shi_play() {
+        // `50#，复式二中二`：50 是三中三的金额（`#` 只是备注分隔符），
+        // `复式` 修饰的是后面的二中二，不能把前一个玩法的金额挤成段落金额。
+        for raw in [
+            "04-10-14三中三50#，复式二中二每组各30",
+            "04-10-14三中三50，复式二中二每组各30",
+        ] {
+            let out = conv(raw);
+            let bet_lines: Vec<&str> = out.bets.iter().map(|b| b.line.as_str()).collect();
+            assert_eq!(
+                bet_lines,
+                vec![
+                    "澳 三中三 04,10,14 各组 50",
+                    "澳 二中二 04,10,14 各组 30",
+                ],
+                "{raw} reasons={:?}",
+                out.reasons
+            );
+            assert!(!out.doubtful, "{raw}: {:?}", out.reasons);
+            assert!(!out.invalid, "{raw}: {:?}", out.reasons);
+        }
+
+        // `50#` 行尾：`#` 当作备注分隔符，50 仍是金额。
+        let out = conv("04-10-14三中三50#");
+        assert_eq!(out.bets[0].line, "澳 三中三 04,10,14 各组 50");
+        assert!(!out.doubtful, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn amount_suffix_then_dot_starts_next_group() {
+        // `10块.4.14…`：金额后缀后的点号是组间分隔符，不是小数或号码分隔符。
+        let out = conv("8.18.28.38.48三中三一组10块.4.14.12.49三中三一组10块，澳门");
+        let lines: Vec<&str> = out.bets.iter().map(|b| b.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "澳 三中三 08,18,28,38,48 各组 10",
+                "澳 三中三 04,14,12,49 各组 10",
+            ]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn mixed_comma_and_space_in_numbers_is_doubtful() {
+        // `1 9` 夹在逗号分隔的号码里：可能是漏分隔符，或 `19` 被空格拆开。
+        let out = conv("35，46，48，7，1 9三星二星各5");
+        assert!(out.doubtful, "{:?}", out.reasons);
+        assert!(
+            out.reasons
+                .iter()
+                .any(|r| r.contains("号码之间逗号和空格混用")),
+            "{:?}",
+            out.reasons
+        );
+
+        // 整段统一用空格（`1 2 3`）不算混用。
+        let out = conv("特码狗各5，虎各3，1 2 3 各10");
+        assert!(!out.doubtful, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn handwritten_ten_is_plus_and_two_is_equals() {
+        // 「十」当加号、「二」当等号，`元` 后面直接接下一组号码 → 拆成两注。
+        let out = conv("三中三3十31十29二15元20十10十23二10元");
+        let bet_lines: Vec<&str> = out.bets.iter().map(|b| b.line.as_str()).collect();
+        assert_eq!(
+            bet_lines,
+            vec!["澳 三中三 03,31,29 各组 15", "澳 三中三 20,10,23 各组 10"]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
+
+        // 玩法词里的「十」不能被当成加号。
+        let out = conv("十不中 1,2,3,4,5 各10");
+        assert_eq!(out.bets.len(), 1, "{:?}", out.reasons);
+        assert_eq!(out.bets[0].play, "十不中");
+    }
+
+    #[test]
+    fn handwritten_two_acts_as_equals_before_amount() {
+        let bet_lines = |out: &ConvertOutput| -> Vec<String> {
+            out.bets.iter().map(|b| b.line.clone()).collect()
+        };
+
+        // 「二」当等号写在金额前，等同配置里的「=」：显式总额，不再靠猜。
+        let out = conv("三中三19.24.46二10");
+        assert_eq!(bet_lines(&out), vec!["澳 三中三 19,24,46 各组 10"]);
+        assert!(!out.doubtful, "{:?}", out.reasons);
+
+        // 同一行两组、各自带「二金额」：要按组拆开，不能合并。
+        let out = conv("三中三19.24.46二10，二中二10.20二5");
+        assert_eq!(
+            bet_lines(&out),
+            vec!["澳 三中三 19,24,46 各组 10", "澳 二中二 10,20 各组 5"]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
+
+        // 总额写法：120 按 4 个号码摊成每号 30。
+        let out = conv("13x14x20x39二120米");
+        assert_eq!(bet_lines(&out), vec!["澳 特码 13,14,20,39 各数 30"]);
+
+        // 玩法词里的「二」不能被换掉（尤其是同一行出现多次时）。
+        let out = conv("二中二10.20二5");
+        assert_eq!(bet_lines(&out), vec!["澳 二中二 10,20 各组 5"]);
+    }
+
+    #[test]
+    fn inline_play_headers_apply_only_to_following_group() {
+        // 同一行里「只写玩法」的头（不带金额）只管紧跟的那组号码：
+        // 双星只管第一组，三星只管第二组，不能两组合并后每个玩法都出一遍。
+        let out = convert_with_replacements(
+            "复试双星，13x14x20x39=120米，\
+             复试三星，13x14x20x39=120米，\
+             三星。13x20x41，13x39x41，各20米",
+            &KeywordSettings::default(),
+            &crate::replacements::default_rules(),
+        );
+        let lines: Vec<&str> = out.bets.iter().map(|b| b.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                // 120 是总额，按注数摊分：二中二 C(4,2)=6 注 → 20；三中三 C(4,3)=4 注 → 30。
+                "澳 二中二 13,14,20,39 各组 20",
+                "澳 三中三 13,14,20,39 各组 30",
+                "澳 三中三 13,20,41 各组 20",
+                "澳 三中三 13,39,41 各组 20",
+            ],
+            "reasons={:?}",
+            out.reasons
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn exclamation_mark_splits_groups_with_own_stakes() {
+        // `！` 作为「这一注写完了」的分块符：两段各自带自己的 `/5` 金额。
+        let out = conv("三中三\n14-45-36/5！12-41-48/5！");
+        let lines: Vec<&str> = out.bets.iter().map(|b| b.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "澳 三中三 14,45,36 各组 5",
+                "澳 三中三 12,41,48 各组 5",
+            ]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn comma_groups_each_keep_their_own_play_and_stake() {
+        // 逗号既是号码分隔符，也是组间分隔符：前一组「号码 + 玩法 + 金额」写完后，
+        // 逗号后面下一组号码带自己的玩法，两组不能并成一注。
+        let out = conv("10，35，39，三中三各6， 10，11，35，三中三各5，");
+        let lines: Vec<&str> = out.bets.iter().map(|b| b.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "澳 三中三 10,35,39 各组 6",
+                "澳 三中三 10,11,35 各组 5",
+            ]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn dotted_number_groups_with_drag_keep_three_groups() {
+        // `19.43` / `10.34` / `9.21` 是号码串（点号分隔），不是小数：
+        // 共 6 个号码 + 两个拖 = 3 组拖注，不能按「三个号码 + 两个拖」误判。
+        let b = one("三中三19.43拖10.34拖9.21每组各8");
+        assert_eq!(b.play, "三中三");
+        assert_eq!(b.content, "(19,43)拖(10,34)拖(09,21)");
+        assert_eq!(b.bets, 8.0);
+        assert_eq!(b.amount, 64.0);
+        let out = conv("三中三19.43拖10.34拖9.21每组各8");
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn comma_separated_groups_keep_their_trailing_plays() {
+        // 每组「二中二 + 号码 + 各5」后面跟着只写玩法与金额的「三中三各5，特碰各5」，
+        // 这些玩法属于前面这组号码，不能被并到下组号码上。
+        let out = conv(
+            "二中二10+20+23+28各5，三中三各5，特碰各5，\
+             二中二14+45+36各5，三中三5，特碰各5，\
+             二中二26+49+6+40各5，三中三各5，特碰各5",
+        );
+        let lines: Vec<&str> = out.bets.iter().map(|b| b.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "澳 二中二 10,20,23,28 各组 5",
+                "澳 三中三 10,20,23,28 各组 5",
+                "澳 特碰 10,20,23,28 各组 5",
+                "澳 二中二 14,45,36 各组 5",
+                "澳 三中三 14,45,36 各组 5",
+                "澳 特碰 14,45,36 各组 5",
+                "澳 二中二 26,49,06,40 各组 5",
+                "澳 三中三 26,49,06,40 各组 5",
+                "澳 特碰 26,49,06,40 各组 5",
+            ]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+        assert!(!out.invalid, "{:?}", out.reasons);
     }
 
     #[test]
@@ -5737,8 +6403,9 @@ mod tests {
             ]
         );
 
-        // 写了「复式」时，特碰 / 二中二不插拖。
-        let out = conv("门0尾t5尾复式二星各2特碰各2");
+        // 写了「复式」时，特碰 / 二中二不自动插拖（这里不写乘法分隔符，
+        // 避免把显式分隔符和复式混在一起）。
+        let out = conv("门0尾5尾复式二星各2特碰各2");
         assert!(out.bets.iter().all(|b| !b.line.contains("拖")));
     }
 
@@ -7249,6 +7916,228 @@ mod regression_cases {
         assert_eq!(lines(&out), vec!["澳 三中三 10,20,30 各组 40"]);
     }
 
+    /// 逐个跑一遍当前默认设置里的关键词与替换词，防止某个字段「配置了却不生效」。
+    #[test]
+    fn all_keyword_fields_and_replacements_take_effect() {
+        let s = KeywordSettings::default();
+        let rules = crate::replacements::default_rules();
+        let mut fails: Vec<String> = Vec::new();
 
+        // 两边 / 三边
+        for kw in s.get(Field::BothSides) {
+            let out = convert(&format!("三中三 01,02 {kw} 各10"), &s);
+            let got: Vec<&str> = out.bets.iter().map(|b| b.lottery.as_str()).collect();
+            if got != vec!["香港", "澳门"] {
+                fails.push(format!("both {kw:?} got={got:?} reasons={:?}", out.reasons));
+            }
+        }
+        for kw in s.get(Field::ThreeSides) {
+            let out = convert(&format!("三中三 01,02 {kw} 各10"), &s);
+            let got: Vec<&str> = out.bets.iter().map(|b| b.lottery.as_str()).collect();
+            if got != vec!["香港", "澳门", "老澳门"] {
+                fails.push(format!("three {kw:?} got={got:?} reasons={:?}", out.reasons));
+            }
+        }
 
+        // 每组总额
+        for kw in s.get(Field::PerGroupTotalStake) {
+            let out = convert(&format!("特码 蛇猪鸡 {kw}1000"), &s);
+            if out.bets.len() != 1 || (out.total_stake - 3000.0).abs() > 0.001 {
+                fails.push(format!(
+                    "pergroup {kw:?} bets={:?} total={} reasons={:?}",
+                    out.bets, out.total_stake, out.reasons
+                ));
+            }
+        }
+
+        // 多行金额前缀
+        for kw in s.get(Field::MultiLineStakePrefix) {
+            let out = convert(&format!("{kw}10\n三中三 01,02,03"), &s);
+            let amt = out.bets.first().map(|b| b.amount).unwrap_or(-1.0);
+            if (amt - 10.0).abs() > 0.001 {
+                fails.push(format!(
+                    "multiline {kw:?} bets={:?} reasons={:?}",
+                    out.bets, out.reasons
+                ));
+            }
+        }
+
+        // 区间
+        for kw in s.get(Field::Range) {
+            let out = convert(&format!("特码 1{kw}5 各10"), &s);
+            if out.bets.first().map(|b| b.content.as_str()) != Some("01,02,03,04,05") {
+                fails.push(format!("range {kw:?} bets={:?}", out.bets));
+            }
+        }
+
+        // 交集
+        for kw in s.get(Field::Intersection) {
+            let out = convert(&format!("特码 11,12,45,23{kw}大 各10"), &s);
+            if out.bets.first().map(|b| b.content.as_str()) != Some("45") {
+                fails.push(format!("intersection {kw:?} bets={:?}", out.bets));
+            }
+        }
+
+        // 乘法分隔符
+        for kw in s.get(Field::Multiplication) {
+            let out = convert(&format!("二中二 01{kw}02 各10"), &s);
+            let got = out.bets.first().map(|b| b.line.as_str()).unwrap_or("");
+            if !got.contains("拖") {
+                fails.push(format!("mul {kw:?} got={got:?} reasons={:?}", out.reasons));
+            }
+        }
+
+        // 每条替换词都要真的改变转换结果。
+        // (原词, 输入, 期望玩法, 期望内容 / 是否拖注)
+        let rule_cases: &[(&str, &str, &str, &str)] = &[
+            ("复试", "特碰 马猴 复试 各50", "特碰", ""),
+            ("蓝色", "特码 蓝色 各10", "特码", ""),
+            ("=中=", "=中= 01,02 各10", "二中二", "01,02"),
+            ("t", "二中二 01t02 各10", "二中二", "拖"),
+            ("三三", "三三 01,02,03 各10", "三中三", "01,02,03"),
+            ("X", "二中二 01X02 各10", "二中二", "拖"),
+            ("✕", "二中二 01✕02 各10", "二中二", "拖"),
+            ("x", "二中二 01x02 各10", "二中二", "拖"),
+            ("Ⅹ", "二中二 01Ⅹ02 各10", "二中二", "拖"),
+            ("三🀄️三", "三🀄️三 01,02,03 各10", "三中三", "01,02,03"),
+            ("二🀄️二", "二🀄️二 01,02 各10", "二中二", "01,02"),
+            ("×", "二中二 01×02 各10", "二中二", "拖"),
+            ("✖", "二中二 01✖02 各10", "二中二", "拖"),
+        ];
+        for (from, raw, want_play, want_content) in rule_cases {
+            let out = convert_with_replacements(raw, &s, &rules);
+            let Some(bet) = out.bets.first() else {
+                fails.push(format!("replace {from:?} raw={raw:?} 无结果 reasons={:?}", out.reasons));
+                continue;
+            };
+            if bet.play != *want_play {
+                fails.push(format!(
+                    "replace {from:?} raw={raw:?} play={:?} want={want_play:?}",
+                    bet.play
+                ));
+            }
+            if *want_content == "拖" {
+                if !bet.line.contains("拖") {
+                    fails.push(format!("replace {from:?} raw={raw:?} 未按拖注输出 line={:?}", bet.line));
+                }
+            } else if !want_content.is_empty() && bet.content != *want_content {
+                fails.push(format!(
+                    "replace {from:?} raw={raw:?} content={:?} want={want_content:?}",
+                    bet.content
+                ));
+            }
+        }
+        // 复试→复式：特碰带复式时不插拖。
+        let out = convert_with_replacements("特碰 马猴 复试 各50", &s, &rules);
+        if out.bets.iter().any(|b| b.line.contains("拖")) {
+            fails.push("复试替换后仍插拖".to_string());
+        }
+
+        assert!(fails.is_empty(), "{}", fails.join("\n"));
+    }
+
+    #[test]
+    fn head_and_tail_ranges_expand() {
+        // 与设置页说明一致：1头至4头 = 10...49。
+        let out = conv("特码 1头至4头 各10");
+        let b = &out.bets[0];
+        assert_eq!(b.bets, 40.0);
+        assert!(b.content.starts_with("10,11") && b.content.ends_with(",48,49"));
+        assert!((b.amount - 400.0).abs() < 1e-6);
+
+        // 1尾至9尾 = 除 10/20/30/40 外的 45 个号码。
+        let out = conv("特码 1尾至9尾 各10");
+        let b = &out.bets[0];
+        assert_eq!(b.bets, 45.0);
+        assert!(b.content.starts_with("01,02,03"));
+        assert!(!b.content.split(',').any(|t| t == "10" || t == "20" || t == "30" || t == "40"));
+
+        // 区间关键词允许写多个字（如「直到」）。
+        let mut s = KeywordSettings::default();
+        s.set(Field::Range, vec!["直到".to_string()]);
+        let out = convert("特码 1直到5 各10", &s);
+        assert_eq!(out.bets[0].content, "01,02,03,04,05");
+        assert_eq!(out.bets[0].bets, 5.0);
+    }
+
+    #[test]
+    fn all_configured_multiplication_keywords_split_drag_groups() {
+        // 设置里的每个乘法分隔词都要生效，不能只认第一个「拖」。
+        for sep in ["碰", "T", "*", "·", "乘", "✘"] {
+            let mut settings = KeywordSettings::default();
+            let mut kws = settings.get(Field::Multiplication).to_vec();
+            if !kws.contains(&sep.to_string()) {
+                kws.push(sep.to_string());
+            }
+            settings.set(Field::Multiplication, kws);
+
+            let out = convert(&format!("二中二 01{sep}02 各10"), &settings);
+            assert_eq!(
+                lines(&out),
+                vec!["澳 二中二 (01)拖(02) 各组 10"],
+                "sep={sep}"
+            );
+
+            let out = convert(&format!("三中三 1尾{sep}2尾{sep}3尾 各10"), &settings);
+            assert_eq!(
+                lines(&out),
+                vec!["澳 三中三 (1尾)拖(2尾)拖(3尾) 各组 10"],
+                "sep={sep}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_numbers_inherit_trailing_play_and_stake() {
+        // 三个号码行都没写玩法或金额，玩法头在最后一行：全部按三中三共用 各5。
+        // 第一行行末的 43 是第三个号码，不能猜成金额、更不能因此变成特码。
+        let out = conv("11、27、43\n7、19、33\n9、25、41\n3、15、45三中三各5");
+        assert_eq!(
+            lines(&out),
+            vec![
+                "澳 三中三 11,27,43 各组 5",
+                "澳 三中三 07,19,33 各组 5",
+                "澳 三中三 09,25,41 各组 5",
+                "澳 三中三 03,15,45 各组 5",
+            ]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+    }
+
+    #[test]
+    fn first_line_with_explicit_stake_before_later_play_stays_special() {
+        // 第一行自己写了显式金额词「各5」→ 按默认特码；后面的号码行继承末尾的三中三。
+        let out = conv("11、27、43 各5\n7、19、33\n9、25、41\n3、15、45三中三各5");
+        assert_eq!(
+            lines(&out),
+            vec![
+                "澳 特码 11,27,43 各数 5",
+                "澳 三中三 07,19,33 各组 5",
+                "澳 三中三 09,25,41 各组 5",
+                "澳 三中三 03,15,45 各组 5",
+            ]
+        );
+        assert!(out.doubtful, "{:?}", out.reasons);
+        assert!(
+            out.reasons.iter().any(|r| r.contains("多种玩法")),
+            "{:?}",
+            out.reasons
+        );
+    }
+
+    #[test]
+    fn zodiac_trios_with_trailing_play_become_drag_lines() {
+        // 逗号分隔的每一组是三个相邻生肖；后面的「三中三各1」同时给三组
+        // 玩法与金额。每组各自按拖注输出，保留生肖写法，不展开成号码。
+        let out = conv("蛇猪鸡，虎鸡鼠，马鸡猪，三中三各1");
+        assert_eq!(
+            lines(&out),
+            vec![
+                "澳 三中三 蛇拖猪拖鸡 各组 1",
+                "澳 三中三 虎拖鸡拖鼠 各组 1",
+                "澳 三中三 马拖鸡拖猪 各组 1",
+            ]
+        );
+        assert!(!out.doubtful, "{:?}", out.reasons);
+    }
 }

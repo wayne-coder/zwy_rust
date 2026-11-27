@@ -144,7 +144,7 @@ fn main() -> eframe::Result {
         // 也不能互相遮挡——两者叠加后与默认宽度 1090 基本一致，再窄就会裁掉内容。
         .with_min_inner_size([1090.0, 520.0])
         // 标题栏图标右侧显示软件名与版本号。
-        .with_title(concat!("账无忧 v", env!("CARGO_PKG_VERSION")));
+        .with_title(concat!("小掌柜 v", env!("CARGO_PKG_VERSION")));
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -155,7 +155,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "账无忧",
+        "小掌柜",
         options,
         Box::new(|cc| {
             ui::install_fonts(&cc.egui_ctx);

@@ -530,9 +530,6 @@ impl Default for Status {
 pub struct Diff {
     pub blocking: Option<String>,
     pub same: bool,
-    pub total_equal: bool,
-    pub total_local: String,
-    pub total_remote: String,
     pub draw_note: Option<String>,
     pub bettors: Vec<BettorDiff>,
 }
@@ -559,18 +556,9 @@ fn batch_text(r: Option<&Batch>) -> String {
 }
 
 pub fn diff(local: &Model, remote: &Model) -> Diff {
-    let mut out = Diff {
-        total_equal: local.total_code == remote.total_code,
-        total_local: local.total_code.clone(),
-        total_remote: remote.total_code.clone(),
-        ..Default::default()
-    };
-    if !local.date.is_empty() && !remote.date.is_empty() && local.date != remote.date {
-        out.blocking = Some(format!(
-            "两边的日期不同（本机 {}，对方 {}），没有开始比对。",
-            local.date, remote.date
-        ));
-    }
+    let mut out = Diff::default();
+    // 对账只看五个总额（批数 / 总金额 / 总中奖 / 总回水 / 总输赢），
+    // 日期与总码不参与判定。
     if !draws_equal(&local.draws, &remote.draws) {
         out.draw_note = Some("两边录入的开奖号码不同（没有命中时账目仍可能一致）。".into());
     }
@@ -619,12 +607,6 @@ pub fn diff(local: &Model, remote: &Model) -> Diff {
                         remote: "—".into(),
                         equal: false,
                     },
-                    FieldRow {
-                        label: "码",
-                        local: l.code.clone(),
-                        remote: "—".into(),
-                        equal: false,
-                    },
                 ],
                 Vec::new(),
             ),
@@ -661,12 +643,6 @@ pub fn diff(local: &Model, remote: &Model) -> Diff {
                         remote: money(r.total_net),
                         equal: false,
                     },
-                    FieldRow {
-                        label: "码",
-                        local: "—".into(),
-                        remote: r.code.clone(),
-                        equal: false,
-                    },
                 ],
                 Vec::new(),
             ),
@@ -681,7 +657,6 @@ pub fn diff(local: &Model, remote: &Model) -> Diff {
         });
     }
     out.same = out.bettors.iter().all(|b| b.status == Status::Same)
-        && out.total_equal
         && out.blocking.is_none();
     out
 }
@@ -717,12 +692,6 @@ fn compare_bettor(l: &Bettor, r: &Bettor) -> (Status, Vec<FieldRow>, Vec<BatchRo
             local: money(l.total_net),
             remote: money(r.total_net),
             equal: money(l.total_net) == money(r.total_net),
-        },
-        FieldRow {
-            label: "码",
-            local: l.code.clone(),
-            remote: r.code.clone(),
-            equal: l.code == r.code,
         },
     ];
     let mut batches: Vec<BatchRow> = Vec::new();

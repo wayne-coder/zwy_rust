@@ -57,7 +57,7 @@ python PPOCRLabel/PPOCRLabel.py
 导出小字典（字符集 = 当前关键词设置 + 生肖 + 数字符号）：
 
 ```bash
-账无忧.exe --export-ocr-dict ppocr_keys.txt
+小掌柜.exe --export-ocr-dict ppocr_keys.txt
 ```
 
 训练与推理必须使用**同一份字典**；以后改了关键词词表，要重新导出并重新训练，

@@ -1,4 +1,4 @@
-//! 账无忧界面：
+//! 小掌柜界面：
 //! - 主页：顶部按钮分组（注单 / 对奖 / 设置），左侧成员竖排 Tab，中间常驻注单消息列表，右侧注单详情面板；
 //! - 选定会员页：联系人 / 群聊两个 Tab，群聊树形展开成员，全部可勾选；
 //! - 导入注单：弹窗设置日期与时段，导入后在所选时段内实时追加新消息。
@@ -854,7 +854,7 @@ impl ViewerApp {
             ledger_msg: None,
             reconcile_open: false,
             reconcile_pasted: String::new(),
-            reconcile_only_diff: false,
+            reconcile_only_diff: true,
             reconcile_msg: None,
             bill_export_open: false,
             bill_export_candidates: Vec::new(),
@@ -959,7 +959,7 @@ impl ViewerApp {
             pwd_msg: None,
             pwd_rx: None,
             auth_refresh_rx: None,
-            window_title: format!("账无忧 v{}", env!("CARGO_PKG_VERSION")),
+            window_title: format!("小掌柜 v{}", env!("CARGO_PKG_VERSION")),
             was_authenticated: false,
             wx_proc_checked: None,
             // 初值先取一次，避免「启动时微信本来就在运行」被当成刚启动而自动重检。
@@ -1154,7 +1154,7 @@ impl ViewerApp {
         self.reference_msg_error = false;
         self.reconcile_open = false;
         self.reconcile_pasted.clear();
-        self.reconcile_only_diff = false;
+        self.reconcile_only_diff = true;
         self.reconcile_msg = None;
         let (tx, rx) = channel();
         self.rx = Some(rx);
@@ -1339,6 +1339,11 @@ impl ViewerApp {
         // 也必须留在候选池里，否则重新导入时会误把更早的同发送人消息当成
         // 撤回目标，导致「已撤回」越导入越多。
         let batch_seen = revoke_candidates(&rows);
+        // 本次导入之前已经在列表里的消息（监控/上一次导入）。
+        // 撤回目标的「按名字猜」只允许在这些旧消息里找：本批新读到的消息如果
+        // 是撤回目标，它已经被微信替换成撤回提示、不会还留在库里；还留在
+        // 库里的上一条并不是被撤回的那条，不能拿来顶替。
+        let prior_orders: Vec<MsgRow> = self.orders.clone();
         let (self_wxid, name_to_usr) = match &self.state {
             State::Ready(d) => {
                 // 撤回提示里的名字可能是备注名，也可能是群昵称：两种都映射到 username。
@@ -1367,7 +1372,13 @@ impl ViewerApp {
             // 撤回提示不进任何列表：先找出被撤回的原消息并记入「已撤回」，
             // 同时把它从当前注单列表里移除。
             if r.kind == "撤回" {
-                self.handle_revoke(&r, &batch_seen, &self_wxid, &name_to_usr);
+                self.handle_revoke(
+                    &r,
+                    &prior_orders,
+                    &batch_seen,
+                    &self_wxid,
+                    &name_to_usr,
+                );
                 continue;
             }
             // 已撤回名单里的原消息：重新导入也不再出现。
@@ -1432,12 +1443,13 @@ impl ViewerApp {
     fn handle_revoke(
         &mut self,
         revoke: &MsgRow,
+        prior_orders: &[MsgRow],
         batch_seen: &[MsgRow],
         self_wxid: &str,
         name_to_usr: &HashMap<String, String>,
     ) {
         let Some(target) =
-            find_revoke_target(revoke, &self.orders, batch_seen, self_wxid, name_to_usr)
+            find_revoke_target(revoke, prior_orders, batch_seen, self_wxid, name_to_usr)
         else {
             return;
         };
@@ -1983,7 +1995,7 @@ impl ViewerApp {
                                         );
                                         let id =
                                             egui::Id::unique(("draw_num", i, j));
-                                        let resp = ui.add(
+                                        let mut resp = ui.add(
                                             egui::TextEdit::singleline(
                                                 &mut self.draw_inputs[i][j],
                                             )
@@ -1999,6 +2011,12 @@ impl ViewerApp {
                                             } else {
                                                 TEXT
                                             }),
+                                        );
+                                        text_edit_context_menu(
+                                            ui.ctx(),
+                                            resp.id,
+                                            &mut self.draw_inputs[i][j],
+                                            &mut resp,
                                         );
                                         if resp.changed() {
                                             let cleaned: String = self.draw_inputs[i][j]
@@ -2085,11 +2103,17 @@ impl ViewerApp {
 
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("整期粘贴").size(10.5).color(SUB));
-                                ui.add(
+                                let mut resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.draw_paste[i])
                                         .hint_text("01 02 03 04 05 06 07")
                                         .desired_width(220.0)
                                         .font(FontId::proportional(11.5)),
+                                );
+                                text_edit_context_menu(
+                                    ui.ctx(),
+                                    resp.id,
+                                    &mut self.draw_paste[i],
+                                    &mut resp,
                                 );
                                 if ui.add(tiny_button("填入本区", TEXT)).clicked() {
                                     match parse_draw_paste(&self.draw_paste[i]) {
@@ -2913,7 +2937,7 @@ impl ViewerApp {
 
         let mut clear = false;
         ui.horizontal(|ui| {
-            ui.add(
+            let mut resp = ui.add(
                 egui::TextEdit::singleline(&mut self.reference_search)
                     .font(FontId::proportional(11.0))
                     .margin(Margin::symmetric(4, 1))
@@ -2921,6 +2945,7 @@ impl ViewerApp {
                     .hint_text(RichText::new("搜索引用 / 被引用原文 / 发送人").size(9.0))
                     .desired_width(260.0),
             );
+            text_edit_context_menu(ui.ctx(), resp.id, &mut self.reference_search, &mut resp);
             if !self.reference_search.is_empty()
                 && ui.add(tiny_button("清除搜索", SUB)).clicked()
             {
@@ -2960,11 +2985,17 @@ impl ViewerApp {
                     .size(10.5)
                     .color(SUB),
                 );
-                ui.add(
+                let mut resp = ui.add(
                     egui::TextEdit::multiline(&mut self.reference_ignore_edit)
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .hint_text("每行一个，例如：1\n2"),
+                );
+                text_edit_context_menu(
+                    ui.ctx(),
+                    resp.id,
+                    &mut self.reference_ignore_edit,
+                    &mut resp,
                 );
                 ui.horizontal(|ui| {
                     if ui.add(tiny_button("保存规则", TEXT)).clicked() {
@@ -3224,13 +3255,30 @@ impl ViewerApp {
 
     /// 选中注单列表里的第 `index` 条，并同步详情面板。
     fn select_order_index(&mut self, index: usize, ctx: &egui::Context) {
-        // 清掉成员 / 分组过滤，保证目标行一定在可见列表里。
+        let target_row = self.orders[index].clone();
+        // 清掉成员筛选，保证目标行一定在可见列表里；分组过滤不要直接切回
+        // 「全部分组」——当前分组已经包含目标行时保持不变；不包含时切到目标行
+        // 所属的分组，只有它不属于任何分组（例如没有分组、或来源是「选定会员」）
+        // 时才退回全部分组。
         self.member_focus = None;
-        self.order_filter = None;
+        let keep_group = match self.order_filter.as_deref() {
+            None => true,
+            Some(name) => self
+                .groups
+                .iter()
+                .find(|g| g.name == name)
+                .is_some_and(|g| g.matches(&target_row)),
+        };
+        if !keep_group {
+            self.order_filter = self
+                .groups
+                .iter()
+                .find(|g| g.matches(&target_row))
+                .map(|g| g.name.clone());
+        }
         self.page = Page::Home;
         // 从「引用」页签定位回来时切回注单列表，用户才看得到选中行。
         self.order_tab = OrderTab::Active;
-        let target_row = self.orders[index].clone();
         let key = (
             target_row.sort,
             target_row.chat.clone(),
@@ -3480,11 +3528,17 @@ impl ViewerApp {
                         .color(SUB),
                 );
                 let input_id = egui::Id::unique("batch_replace_input");
-                ui.add(
+                let mut resp = ui.add(
                     egui::TextEdit::singleline(&mut self.batch_replace_to)
                         .id(input_id)
                         .desired_width(f32::INFINITY)
                         .hint_text("留空表示删除"),
+                );
+                text_edit_context_menu(
+                    ui.ctx(),
+                    resp.id,
+                    &mut self.batch_replace_to,
+                    &mut resp,
                 );
                 if ui.memory(|m| m.focused()).is_none() {
                     ui.memory_mut(|m| m.request_focus(input_id));
@@ -4080,10 +4134,16 @@ impl ViewerApp {
                 window_header_cursor(ui);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("保存到").size(12.0).color(MUTED));
-                    ui.add(
+                    let mut resp = ui.add(
                         egui::TextEdit::singleline(&mut self.bill_export_dir)
                             .desired_width(320.0)
                             .hint_text("文件夹路径"),
+                    );
+                    text_edit_context_menu(
+                        ui.ctx(),
+                        resp.id,
+                        &mut self.bill_export_dir,
+                        &mut resp,
                     );
                 });
                 ui.add_space(3.0);
@@ -4382,8 +4442,7 @@ impl ViewerApp {
                             ui.add_space(10.0);
                             ui.label(
                                 RichText::new(format!(
-                                    "{} · {} 位投注人 · {} 批",
-                                    local.date,
+                                    "{} 位投注人 · {} 批",
                                     local.bettors.len(),
                                     batch_total
                                 ))
@@ -4402,25 +4461,12 @@ impl ViewerApp {
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
-                                RichText::new(format!("日期 {}", local.date))
-                                    .size(11.0)
-                                    .color(MUTED),
-                            );
-                            ui.add_space(12.0);
-                            ui.label(
                                 RichText::new(format!(
                                     "投注人 {} 位",
                                     local.bettors.len()
                                 ))
                                 .size(11.0)
                                 .color(MUTED),
-                            );
-                            ui.add_space(12.0);
-                            ui.label(
-                                RichText::new(format!("总码 {}", local.total_code))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(BILL_TEXT),
                             );
                         });
                         egui::Frame::new()
@@ -4476,13 +4522,26 @@ impl ViewerApp {
                                 .color(BILL_TEXT),
                         );
                         ui.add_space(4.0);
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.reconcile_pasted)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(8)
-                                .hint_text(
-                                    "把对方发来的对账文本整段粘到这里（不用改一个字）",
-                                ),
+                        // 粘贴框最高 80px，超出在框内滚动，避免把下面的比对结果挤走。
+                        let mut resp = egui::ScrollArea::vertical()
+                            .max_height(80.0)
+                            .id_salt("reconcile_pasted_scroll")
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.reconcile_pasted)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(3)
+                                        .hint_text(
+                                            "把对方发来的对账文本整段粘到这里（不用改一个字）",
+                                        ),
+                                )
+                            })
+                            .inner;
+                        text_edit_context_menu(
+                            ui.ctx(),
+                            resp.id,
+                            &mut self.reconcile_pasted,
+                            &mut resp,
                         );
                         ui.add_space(10.0);
 
@@ -4496,7 +4555,7 @@ impl ViewerApp {
                         if self.reconcile_pasted.trim().is_empty() {
                             ui.label(
                                 RichText::new(
-                                    "粘上对方的文本后这里会立刻出结果：先看总码，不一致再往下看是哪个投注人、第几批。",
+                                    "粘上对方的文本后这里会立刻出结果：逐个投注人比对批数、总金额、总中奖、总回水和总输赢，有差异再往下看是第几批。",
                                 )
                                 .size(11.5)
                                 .color(MUTED),
@@ -4547,50 +4606,6 @@ impl ViewerApp {
                                         );
                                     });
                                 ui.add_space(4.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        RichText::new("总码").size(11.5).color(BILL_TEXT),
-                                    );
-                                    ui.label(
-                                        RichText::new(&d.total_local)
-                                            .size(11.5)
-                                            .monospace()
-                                            .color(BILL_TEXT),
-                                    );
-                                    ui.label(
-                                        RichText::new(if d.total_equal {
-                                            "="
-                                        } else {
-                                            "≠"
-                                        })
-                                        .size(13.0)
-                                        .strong()
-                                        .color(if d.total_equal {
-                                            MONEY_GREEN
-                                        } else {
-                                            MONEY_RED
-                                        }),
-                                    );
-                                    ui.label(
-                                        RichText::new(&d.total_remote)
-                                            .size(11.5)
-                                            .monospace()
-                                            .color(BILL_TEXT),
-                                    );
-                                    ui.label(
-                                        RichText::new(if d.total_equal {
-                                            "一致"
-                                        } else {
-                                            "不一致"
-                                        })
-                                        .size(11.0)
-                                        .color(if d.total_equal {
-                                            MONEY_GREEN
-                                        } else {
-                                            MONEY_RED
-                                        }),
-                                    );
-                                });
                                 if let Some(note) = &d.draw_note {
                                     ui.label(
                                         RichText::new(note).size(11.0).color(ORANGE),
@@ -5024,15 +5039,27 @@ impl ViewerApp {
                     }
                     match self.code_report_mode {
                         CodeReportMode::Risk => {
-                            ui.add(
+                            let mut resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.code_report_threshold)
                                     .desired_width(90.0),
                             );
+                            text_edit_context_menu(
+                                ui.ctx(),
+                                resp.id,
+                                &mut self.code_report_threshold,
+                                &mut resp,
+                            );
                         }
                         CodeReportMode::Amount => {
-                            ui.add(
+                            let mut resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.code_report_limit)
                                     .desired_width(90.0),
+                            );
+                            text_edit_context_menu(
+                                ui.ctx(),
+                                resp.id,
+                                &mut self.code_report_limit,
+                                &mut resp,
                             );
                         }
                     }
@@ -5287,11 +5314,17 @@ impl ViewerApp {
                                     } else {
                                         String::new()
                                     };
-                                    ui.add(
+                                    let mut resp = ui.add(
                                         egui::TextEdit::singleline(entry)
                                             .desired_width(64.0)
                                             .align(Align2::RIGHT_CENTER)
                                             .hint_text(hint),
+                                    );
+                                    text_edit_context_menu(
+                                        ui.ctx(),
+                                        resp.id,
+                                        entry,
+                                        &mut resp,
                                     );
                                     let reduce = code_report_reduce_of(
                                         &self.code_report_reduce,
@@ -6113,12 +6146,13 @@ impl ViewerApp {
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let resp = ui.add(
+                let mut resp = ui.add(
                     egui::TextEdit::singleline(&mut self.risk_xm_search)
                         .desired_width(130.0)
                         .hint_text("搜索组合")
                         .font(egui::TextStyle::Small),
                 );
+                text_edit_context_menu(ui.ctx(), resp.id, &mut self.risk_xm_search, &mut resp);
                 if resp.changed() {
                     self.risk_xm_page = 1;
                 }
@@ -6371,12 +6405,13 @@ impl ViewerApp {
             }
             ui.add_space(12.0);
             ui.label(RichText::new("跳至").size(11.5).color(MUTED));
-            ui.add(
+            let mut resp = ui.add(
                 egui::TextEdit::singleline(&mut self.risk_xm_jump)
                     .desired_width(48.0)
                     .font(font.clone())
                     .hint_text(RichText::new(page.to_string()).size(11.5)),
             );
+            text_edit_context_menu(ui.ctx(), resp.id, &mut self.risk_xm_jump, &mut resp);
             ui.label(RichText::new("页").size(11.5).color(MUTED));
             if ghost_button_sized(
                 ui,
@@ -6395,12 +6430,11 @@ impl ViewerApp {
         ui.add_space(10.0);
     }
 
-    /// 左侧竖排成员 Tab：全部分组 = 所有联系人 / 群成员；选定某分组 = 该分组成员。
-    fn member_rail(&mut self, ui: &mut egui::Ui, data: &AppData) {
-        let filter = self.order_filter.clone();
+    /// 当前分组过滤下，成员条要显示的联系人 / 群成员集合。
+    fn rail_member_sets(&self) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
         let mut contacts: BTreeSet<String> = BTreeSet::new();
         let mut members: BTreeSet<(String, String)> = BTreeSet::new();
-        match &filter {
+        match &self.order_filter {
             None => {
                 for g in &self.groups {
                     contacts.extend(g.contacts.iter().cloned());
@@ -6414,6 +6448,19 @@ impl ViewerApp {
                 }
             }
         }
+        (contacts, members)
+    }
+
+    /// 成员条当前的成员数（联系人 + 群成员）。
+    fn rail_member_count(&self) -> usize {
+        let (contacts, members) = self.rail_member_sets();
+        contacts.len() + members.len()
+    }
+
+    /// 左侧竖排成员 Tab：全部分组 = 所有联系人 / 群成员；选定某分组 = 该分组成员。
+    fn member_rail(&mut self, ui: &mut egui::Ui, data: &AppData) {
+        let filter_before = self.order_filter.clone();
+        let (contacts, members) = self.rail_member_sets();
         let name_of = |k: &MemberKey| match k {
             MemberKey::Contact(c) => display_of_contact(data, c),
             MemberKey::Member(chat, m) => data
@@ -6434,10 +6481,7 @@ impl ViewerApp {
         ordered.extend(keys.iter().filter(|k| self.is_upline_key(k)).cloned());
         ordered.extend(keys.iter().filter(|k| !self.is_upline_key(k)).cloned());
 
-        let title = match &filter {
-            Some(name) => format!("「{name}」"),
-            None => "全部成员".to_string(),
-        };
+        let group_names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
         egui::Frame::new()
             .fill(RAIL_BG)
             // 全部成员面板左右留白固定 2px。
@@ -6445,11 +6489,43 @@ impl ViewerApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.set_min_height(ui.available_height());
+                // 分组下拉放在成员列表标题的位置：选中分组后，下面只列该组成员。
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(title).size(10.5).strong().color(TEXT));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        count_pill(ui, keys.len());
-                    });
+                    if group_names.is_empty() {
+                        ui.label(RichText::new("全部成员").size(10.5).strong().color(TEXT));
+                    } else {
+                        let selected = self
+                            .order_filter
+                            .clone()
+                            .unwrap_or_else(|| "全部分组".to_string());
+                        // 成员条很窄，只显示前四个字；完整分组名放在悬停提示里。
+                        let short: String = selected.chars().take(4).collect();
+                        egui::ComboBox::from_id_salt("member_rail_group_filter")
+                            .width(ui.available_width())
+                            .selected_text(RichText::new(short).size(10.5))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.order_filter, None, "全部分组");
+                                for name in &group_names {
+                                    ui.selectable_value(
+                                        &mut self.order_filter,
+                                        Some(name.clone()),
+                                        name,
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text(format!("按分组过滤成员与注单（当前：{selected}）"));
+                        // 切换分组后，原来选中的成员 / 注单可能已不在本组，清除选中。
+                        if self.order_filter != filter_before {
+                            self.member_focus = None;
+                            self.selected_order_row = None;
+                            self.selected_order_key = None;
+                            self.converted = None;
+                            self.edit_text.clear();
+                            self.edit_time.clear();
+                            self.ocr_msg = None;
+                        }
+                    }
                 });
                 ui.add_space(4.0);
                 hairline(ui);
@@ -6558,7 +6634,7 @@ impl ViewerApp {
                                     }
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         ui.add_space(3.0);
-                                        let resp = ui
+                                        let mut resp = ui
                                             .add(
                                                 egui::TextEdit::singleline(&mut self.edit_time)
                                                     .desired_width(68.0)
@@ -6566,6 +6642,12 @@ impl ViewerApp {
                                                     .hint_text("时间"),
                                             )
                                             .on_hover_text("可修改这条注单的时间");
+                                        text_edit_context_menu(
+                                            ui.ctx(),
+                                            resp.id,
+                                            &mut self.edit_time,
+                                            &mut resp,
+                                        );
                                         time_changed = resp.changed();
                                         ui.add_space(4.0);
                                         ui.label(
@@ -6698,9 +6780,9 @@ impl ViewerApp {
                                 let original_box = egui::Frame::new()
                                     .fill(STRIPE)
                                     .stroke(Stroke::new(1.0, BORDER))
-                                    // 原文面板：左右各 2px，文本框不做圆角。
+                                    // 原文面板：内容左右各留 5px 内边距，文本框不做圆角。
                                     .corner_radius(CornerRadius::ZERO)
-                                    .inner_margin(Margin::symmetric(2, 8))
+                                    .inner_margin(Margin::symmetric(5, 8))
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
                                         ui.set_min_height((body_h - 60.0).max(80.0));
@@ -6750,7 +6832,7 @@ impl ViewerApp {
                                                             .margin(Margin::ZERO)
                                                             .desired_width(f32::INFINITY)
                                                             .desired_rows(20)
-                                                            .font(egui::FontId::proportional(13.5))
+                                                            .font(egui::FontId::proportional(12.5))
                                                             .hint_text("在这里修改原文")
                                                             .show(ui)
                                                     })
@@ -7054,13 +7136,8 @@ impl ViewerApp {
                                     section_label(ui, "明细");
                                 });
                                 ui.add_space(6.0);
-                                // 列宽按内容自适应；窗口再窄时在底部出现水平滚动条。
-                                let items: &[BetItem] = converted
-                                    .as_ref()
-                                    .map(|c| c.bets.as_slice())
-                                    .unwrap_or(&[]);
-                                let (table_w, widths) =
-                                    detail_widths(ui, ui.available_width(), items, &mul_sep);
+                                // 列宽固定，不随内容或窗口变化；内容列固定宽度内换行。
+                                let (table_w, widths) = detail_widths();
                                 egui::ScrollArea::horizontal()
                                     .id_salt("detail_table_hscroll")
                                     .auto_shrink([false, false])
@@ -7136,7 +7213,6 @@ impl ViewerApp {
     }
 
     fn orders_panel(&mut self, ui: &mut egui::Ui, data: &AppData) {
-        let group_names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
         // 已撤回页签只显示当前时段内的记录，计数也按这个范围算。
         let revoked_count = self.revoked_in_range().len();
         // 标题行右侧的紧凑时段：`11-26 17:00–21:30`，完整说明放悬停。
@@ -7213,32 +7289,17 @@ impl ViewerApp {
                     }
                     return;
                 }
-                // 未撤回：分组过滤 + 上/下一条，合并成列表上方的一行。
+                // 未撤回：上/下一条等操作，合并成列表上方的一行。
+                // （分组过滤已移到左侧成员列表标题的位置。）
                 ui.add_space(2.0);
 
                 let mut nav: Option<isize> = None;
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     ui.spacing_mut().button_padding.x = 6.0;
-                    if !group_names.is_empty() {
-                        let selected = self
-                            .order_filter
-                            .clone()
-                            .unwrap_or_else(|| "全部分组".to_string());
-                        egui::ComboBox::from_id_salt("order_group_filter")
-                            .width(96.0)
-                            .selected_text(RichText::new(selected).size(11.5))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.order_filter, None, "全部分组");
-                                for name in &group_names {
-                                    ui.selectable_value(
-                                        &mut self.order_filter,
-                                        Some(name.clone()),
-                                        name,
-                                    );
-                                }
-                            });
-                    }
+                    // 当前分组的成员数，放在导航按钮前面。
+                    ui.label(RichText::new("分组成员数量：").size(10.0).color(SUB));
+                    count_pill(ui, self.rail_member_count());
                     if ui
                         .add(tiny_button("上一条", TEXT))
                         .on_hover_text("选中上一条注单")
@@ -7397,13 +7458,14 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             let reserve = if self.reference_search.is_empty() { 0.0 } else { 40.0 };
             let width = (ui.available_width() - reserve).max(80.0);
-            ui.add(
+            let mut resp = ui.add(
                 egui::TextEdit::singleline(&mut self.reference_search)
                     .font(FontId::proportional(11.0))
                     .margin(Margin::symmetric(4, 1))
                     .hint_text(RichText::new("搜索引用 / 被引用 / 发送人").size(9.0))
                     .desired_width(width),
             );
+            text_edit_context_menu(ui.ctx(), resp.id, &mut self.reference_search, &mut resp);
             if !self.reference_search.is_empty()
                 && ui
                     .add(tiny_button("×", SUB))
@@ -7650,7 +7712,8 @@ impl ViewerApp {
                             .hint_text(RichText::new(hint).color(SUB))
                             .desired_width(240.0)
                             .align(Align2::LEFT_CENTER);
-                        ui.add(edit);
+                        let mut resp = ui.add(edit);
+                        text_edit_context_menu(ui.ctx(), resp.id, &mut self.search, &mut resp);
                     });
             });
         });
@@ -7843,7 +7906,8 @@ impl ViewerApp {
                 let edit = egui::TextEdit::singleline(&mut self.group_name)
                     .hint_text(RichText::new("例如：A 组、老客户").color(SUB))
                     .desired_width(f32::INFINITY);
-                let resp = ui.add(edit);
+                let mut resp = ui.add(edit);
+                text_edit_context_menu(ui.ctx(), resp.id, &mut self.group_name, &mut resp);
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(8.0);
                 ui.label(
@@ -7935,7 +7999,8 @@ impl ViewerApp {
                 let edit = egui::TextEdit::singleline(&mut self.group_rename_input)
                     .hint_text(RichText::new("例如：A 组、老客户").color(SUB))
                     .desired_width(f32::INFINITY);
-                let resp = ui.add(edit);
+                let mut resp = ui.add(edit);
+                text_edit_context_menu(ui.ctx(), resp.id, &mut self.group_rename_input, &mut resp);
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if let Some(e) = &error {
                     ui.add_space(6.0);
@@ -8367,10 +8432,16 @@ impl ViewerApp {
                             let buf = buffers.entry(g.field).or_default();
                             let mut add = false;
                             ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(buf)
+                                let mut resp = ui.add(
+                                    egui::TextEdit::singleline(&mut *buf)
                                         .hint_text(g.placeholder)
                                         .desired_width(220.0),
+                                );
+                                text_edit_context_menu(
+                                    ui.ctx(),
+                                    resp.id,
+                                    &mut *buf,
+                                    &mut resp,
                                 );
                                 let word = buf.trim().to_string();
                                 let duplicate = !word.is_empty() && items.iter().any(|x| *x == word);
@@ -8459,16 +8530,28 @@ impl ViewerApp {
                             }
                             ui.add_space(5.0);
                             ui.horizontal(|ui| {
-                                ui.add(
+                                let mut resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.keyword_variant)
                                         .hint_text("生僻字")
                                         .desired_width(80.0),
                                 );
+                                text_edit_context_menu(
+                                    ui.ctx(),
+                                    resp.id,
+                                    &mut self.keyword_variant,
+                                    &mut resp,
+                                );
                                 ui.label(RichText::new("→").size(12.0).color(SUB));
-                                ui.add(
+                                let mut resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.keyword_correct)
                                         .hint_text("正确生肖")
                                         .desired_width(80.0),
+                                );
+                                text_edit_context_menu(
+                                    ui.ctx(),
+                                    resp.id,
+                                    &mut self.keyword_correct,
+                                    &mut resp,
                                 );
                                 let v = self
                                     .keyword_variant
@@ -8588,16 +8671,28 @@ impl ViewerApp {
                 hairline(ui);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let mut resp = ui.add(
                         egui::TextEdit::singleline(&mut self.replacement_from)
                             .hint_text("原词，如：复试")
                             .desired_width(150.0),
                     );
+                    text_edit_context_menu(
+                        ui.ctx(),
+                        resp.id,
+                        &mut self.replacement_from,
+                        &mut resp,
+                    );
                     ui.label(RichText::new("→").size(12.0).color(SUB));
-                    ui.add(
+                    let mut resp = ui.add(
                         egui::TextEdit::singleline(&mut self.replacement_to)
                             .hint_text("替换为，如：复式")
                             .desired_width(150.0),
+                    );
+                    text_edit_context_menu(
+                        ui.ctx(),
+                        resp.id,
+                        &mut self.replacement_to,
+                        &mut resp,
                     );
                     let from = self.replacement_from.trim().to_string();
                     let to = self.replacement_to.trim().to_string();
@@ -8810,10 +8905,16 @@ impl ViewerApp {
 
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.add(
+                    let mut resp = ui.add(
                         egui::TextEdit::singleline(&mut self.odds_new_member)
                             .hint_text("会员昵称（全局）")
                             .desired_width(150.0),
+                    );
+                    text_edit_context_menu(
+                        ui.ctx(),
+                        resp.id,
+                        &mut self.odds_new_member,
+                        &mut resp,
                     );
                     let name = self.odds_new_member.trim().to_string();
                     if ui
@@ -9154,14 +9255,14 @@ impl ViewerApp {
                 ui.add_space(8.0);
                 ui.label(RichText::new("原始文本").size(12.0).color(SUB));
                 let raw_id = ui.make_persistent_id("single_raw_edit");
-                let edit = ui.add(
+                let mut edit = ui.add(
                     egui::TextEdit::multiline(&mut self.single_raw)
                         .id(raw_id)
                         .desired_width(f32::INFINITY)
                         .desired_rows(7)
                         .hint_text("粘贴或输入一条注单原文，例如：三中三06.26.44五十"),
                 );
-                text_edit_context_menu(ctx, raw_id, &mut self.single_raw, &edit);
+                text_edit_context_menu(ctx, raw_id, &mut self.single_raw, &mut edit);
                 if edit.changed() {
                     // 原文变了，旧结果不再对应当前输入。
                     self.single_preview = None;
@@ -9363,6 +9464,7 @@ impl ViewerApp {
             sender,
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
         let key = (
             row.sort,
@@ -10229,6 +10331,8 @@ impl Drop for ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 右键会清掉文本框选区，绘制前先留住上一帧的选区供右键菜单使用。
+        snapshot_focused_text_selection(&ctx);
         // 加载结果先处理：登录页上的「微信是否已登录」提示就靠它。
         self.poll();
         self.poll_auth();
@@ -10406,13 +10510,13 @@ impl ViewerApp {
         let acct = self.auth.state();
         let title = if self.auth.authenticated() && !acct.username.is_empty() {
             format!(
-                "账无忧 v{} · 账号 {} · 剩余 {}",
+                "小掌柜 v{} · 账号 {} · 剩余 {}",
                 env!("CARGO_PKG_VERSION"),
                 acct.username,
                 short_remaining(&acct.remaining_text)
             )
         } else {
-            format!("账无忧 v{}", env!("CARGO_PKG_VERSION"))
+            format!("小掌柜 v{}", env!("CARGO_PKG_VERSION"))
         };
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -10455,7 +10559,7 @@ impl ViewerApp {
                 ui.set_min_width(360.0);
                 ui.vertical_centered(|ui| {
                     ui.add_space(4.0);
-                    ui.label(RichText::new("账无忧 · 登录").size(20.0).strong().color(TEXT));
+                    ui.label(RichText::new("小掌柜 · 登录").size(20.0).strong().color(TEXT));
                 });
                 ui.add_space(8.0);
                 // 微信登录状态：绿色 = 确认已登录；金色 = 未登录 / 无法确认。
@@ -10486,19 +10590,21 @@ impl ViewerApp {
                     });
                 ui.add_space(8.0);
                 ui.label(RichText::new("账号").size(12.0).color(SUB));
-                ui.add(
+                let mut resp = ui.add(
                     egui::TextEdit::singleline(&mut self.login_user)
                         .desired_width(f32::INFINITY)
                         .hint_text("请输入管理员提供的账号"),
                 );
+                text_edit_context_menu(ui.ctx(), resp.id, &mut self.login_user, &mut resp);
                 ui.add_space(6.0);
                 ui.label(RichText::new("密码").size(12.0).color(SUB));
-                let pass_resp = ui.add(
+                let mut pass_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.login_pass)
                         .password(true)
                         .desired_width(f32::INFINITY)
                         .hint_text("请输入密码"),
                 );
+                text_edit_context_menu(ui.ctx(), pass_resp.id, &mut self.login_pass, &mut pass_resp);
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.login_remember, RichText::new("记住密码").size(11.5));
@@ -10717,24 +10823,27 @@ impl ViewerApp {
                 ui.add_space(8.0);
                 ui.label(RichText::new("修改密码").size(13.0).strong().color(TEXT));
                 ui.label(RichText::new("原密码").size(11.5).color(SUB));
-                ui.add(
+                let mut resp = ui.add(
                     egui::TextEdit::singleline(&mut self.pwd_old)
                         .password(true)
                         .desired_width(f32::INFINITY),
                 );
+                text_edit_context_menu(ui.ctx(), resp.id, &mut self.pwd_old, &mut resp);
                 ui.label(RichText::new("新密码").size(11.5).color(SUB));
-                ui.add(
+                let mut resp = ui.add(
                     egui::TextEdit::singleline(&mut self.pwd_new)
                         .password(true)
                         .desired_width(f32::INFINITY)
                         .hint_text("至少 6 位"),
                 );
+                text_edit_context_menu(ui.ctx(), resp.id, &mut self.pwd_new, &mut resp);
                 ui.label(RichText::new("确认新密码").size(11.5).color(SUB));
-                ui.add(
+                let mut resp = ui.add(
                     egui::TextEdit::singleline(&mut self.pwd_confirm)
                         .password(true)
                         .desired_width(f32::INFINITY),
                 );
+                text_edit_context_menu(ui.ctx(), resp.id, &mut self.pwd_confirm, &mut resp);
                 if let Some((err, msg)) = &self.pwd_msg {
                     ui.label(
                         RichText::new(msg)
@@ -11062,13 +11171,89 @@ fn group_filters(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_draw_row, clear_orders, find_quote_in_rows, find_quoted_image_index,
-        find_revoke_target, group_filters, parse_draw_paste, quote_match_score, revoke_actor,
-        revoke_candidates, source_from_groups,
+        check_draw_row, clear_orders, detail_content_lines, find_quote_in_rows,
+        find_quoted_image_index, find_revoke_target, group_filters, parse_draw_paste,
+        quote_match_score, revoke_actor, revoke_candidates, source_from_groups,
     };
     use crate::model::{MemberGroup, MsgRow, QuoteRef};
     use eframe::egui;
     use std::collections::{HashMap, HashSet};
+
+    /// 固定宽度的内容列：长内容要按行数换行，短内容保持一行。
+    #[test]
+    fn detail_content_wraps_within_fixed_width() {
+        let ctx = egui::Context::default();
+        let mut lines = 0;
+        let output = ctx.run_ui(Default::default(), |ui| {
+            lines = detail_content_lines(
+                ui,
+                "01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16",
+                "拖",
+                156.0,
+            );
+        });
+        output.drop_without_applying_deltas();
+        assert!(lines > 1, "long content should wrap, lines={lines}");
+
+        let output = ctx.run_ui(Default::default(), |ui| {
+            lines = detail_content_lines(ui, "01,02", "拖", 156.0);
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(lines, 1);
+    }
+
+    /// 行高必须盖住实际换行后的内容，否则最后一行会被行底边裁掉。
+    #[test]
+    fn detail_row_height_fits_wrapped_content() {
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        super::install_style(&ctx);
+        let mut bad: Vec<(usize, f32, f32)> = Vec::new();
+        let output = ctx.run_ui(Default::default(), |ui| {
+            for content in [
+                "08,18,28,38,48,04,14,12,49",
+                "(4尾)拖(8尾)拖(马)",
+                "01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16",
+                "01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24",
+            ] {
+                let width = 156.0;
+                let lines = super::detail_content_lines(ui, content, "拖", width);
+                let row_h = super::detail_content_row_height(lines);
+                let content_h = ui
+                    .scope(|ui| {
+                        ui.set_width(width - 8.0);
+                        ui.spacing_mut().item_spacing = egui::Vec2::new(3.0, 2.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for part in super::detail_content_parts(content, "拖") {
+                                match part {
+                                    super::DetailContentPart::Token(t) => {
+                                        super::detail_token_box(ui, &t)
+                                    }
+                                    super::DetailContentPart::Sep(s) => {
+                                        let (label, color) =
+                                            super::detail_sep_display(&s);
+                                        ui.label(
+                                            egui::RichText::new(label)
+                                                .size(10.0)
+                                                .color(color),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    })
+                    .response
+                    .rect
+                    .height();
+                // Frame 上下各 1px 描边。
+                if content_h + 2.0 > row_h {
+                    bad.push((lines, row_h, content_h + 2.0));
+                }
+            }
+        });
+        output.drop_without_applying_deltas();
+        assert!(bad.is_empty(), "行高不足: {bad:?}");
+    }
 
     /// 顶部开奖号码下面要显示每个号码对应的生肖（平码 + 特码）。
     #[test]
@@ -11145,6 +11330,60 @@ mod tests {
         assert_eq!(super::short_remaining("永不过期"), "永不过期");
     }
 
+    /// 右键点文本框会先清掉选区；右键菜单仍应能对上右键前的选区，
+    /// 因而「复制」保持可用。
+    #[test]
+    fn text_edit_right_click_menu_keeps_previous_selection() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        let id = egui::Id::unique("ctx_menu_test_edit");
+        let text = std::rc::Rc::new(std::cell::RefCell::new("hello world".to_string()));
+        let edit_text = text.clone();
+        let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let changed_ui = changed.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_accessibility_check(false)
+            .with_size(egui::vec2(420.0, 200.0))
+            .build_ui(move |ui| {
+                super::install_fonts(ui.ctx());
+                super::snapshot_focused_text_selection(ui.ctx());
+                let mut text = edit_text.borrow_mut();
+                let mut resp = ui.add(egui::TextEdit::singleline(&mut *text).id(id));
+                super::text_edit_context_menu(ui.ctx(), id, &mut *text, &mut resp);
+                if resp.changed() {
+                    changed_ui.set(true);
+                }
+            });
+        harness.run();
+
+        // 聚焦文本框，再选中前 5 个字符。
+        harness.get_by_role(egui::Role::TextInput).focus();
+        harness.run();
+        let mut st = egui::TextEdit::load_state(&harness.ctx, id).unwrap_or_default();
+        st.cursor
+            .set_char_range(Some(egui::text_selection::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(5),
+            )));
+        st.store(&harness.ctx, id);
+        harness.run();
+
+        harness.get_by_role(egui::Role::TextInput).click_secondary();
+        harness.run();
+
+        let copy = harness.get_by_label_contains("复制");
+        assert!(
+            !copy.accesskit_node().is_disabled(),
+            "右键菜单里的「复制」应使用右键前的选区"
+        );
+
+        // 剪切也应该作用在右键前的选区上，并真的改到字符串。
+        harness.get_by_label_contains("剪切").click();
+        harness.run();
+        assert_eq!(&*text.borrow(), " world");
+        assert!(changed.get(), "菜单剪切后应补上 changed 标记");
+    }
+
     #[test]
     fn window_header_shows_move_cursor() {
         let ctx = egui::Context::default();
@@ -11193,6 +11432,7 @@ mod tests {
             sender: sender.to_string(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
         let other = row("g1", "u2", "李四", "21:01", "三中三 01,02,03 各10");
         let same = row("g1", "u1", "张三", "21:01", "三中三 01,02,03 各10");
@@ -11222,6 +11462,7 @@ mod tests {
             sender: "u1".to_string(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
         assert!(quote_match_score(&order, "g1", &quote, None).is_some());
     }
@@ -11238,6 +11479,7 @@ mod tests {
             sender: sender.to_string(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
         let orders = vec![
             image("g1", "u1", "19:23", 1_700_000_000_000 - 60_000),
@@ -11262,6 +11504,7 @@ mod tests {
             sender: "operator".to_string(),
             link_url: None,
             quote: Some(quote.clone()),
+            revoke_target: None,
         };
         assert_eq!(find_quoted_image_index(&orders, &reference, &quote), Some(1));
 
@@ -11288,6 +11531,7 @@ mod tests {
             sender: sender.to_string(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
 
         // 文字引用：按正文匹配。
@@ -11348,6 +11592,7 @@ mod tests {
             sender: sender.to_string(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
         let revoke = MsgRow {
             kind: "撤回".to_string(),
@@ -11359,6 +11604,7 @@ mod tests {
             sender: String::new(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
 
         // 群聊：按撤回提示里的昵称匹配，取该发送人最近一条。
@@ -11395,8 +11641,8 @@ mod tests {
         assert_eq!(found.content, "自己发的");
     }
 
-    /// 重新导入时，已撤回的原消息虽然不再显示，仍要留在撤回匹配候选池里；
-    /// 否则撤回提示会匹配到更早的同发送人消息，把正常消息误记成「已撤回」。
+    /// 旧消息里如果已经有被撤回的原消息，名称匹配要取它而不是更早的那条
+    /// （重新导入时它会被过滤掉不再显示，但匹配时仍要在旧消息池里）。
     #[test]
     fn revoke_candidates_keep_already_revoked_original() {
         let msg = |content: &str, kind: &str, sort: i64| MsgRow {
@@ -11409,6 +11655,7 @@ mod tests {
             sender: "u1".to_string(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         };
         let earlier = msg("更早的正常消息", "文字", 1500);
         let revoked_original = msg("被撤回的注单", "文字", 2000);
@@ -11417,10 +11664,124 @@ mod tests {
         let candidates = revoke_candidates(&[earlier, revoked_original, notice.clone()]);
         assert_eq!(candidates.len(), 2, "撤回提示本身不应进入候选池");
 
-        let found = find_revoke_target(&notice, &[], &candidates, "self", &HashMap::new())
+        let found = find_revoke_target(&notice, &candidates, &[], "self", &HashMap::new())
             .expect("应该找到被撤回的原消息");
         assert_eq!(found.content, "被撤回的注单");
         assert_eq!(found.sort, 2000);
+    }
+
+    /// 撤回提示带 newmsgid 时按原消息 id 精确匹配；原消息不在本批时不能
+    /// 拿同发送人的其他消息顶替，否则会把没撤回的消息误记成已撤回。
+    #[test]
+    fn revoke_target_id_prevents_matching_unrevoked_message() {
+        let msg = |content: &str, sort: i64| MsgRow {
+            kind: "文字".to_string(),
+            nick: "张三".to_string(),
+            content: content.to_string(),
+            time: "21:00".to_string(),
+            sort,
+            chat: "g1@chatroom".to_string(),
+            sender: "u1".to_string(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        let notice = MsgRow {
+            kind: "撤回".to_string(),
+            nick: String::new(),
+            content: "\"张三\" 撤回了一条消息".to_string(),
+            time: "21:05".to_string(),
+            sort: 5000,
+            chat: "g1@chatroom".to_string(),
+            sender: String::new(),
+            link_url: None,
+            quote: None,
+            revoke_target: Some(2000),
+        };
+
+        // 精确命中 2000，即使 3000 是同发送人更晚的一条。
+        let orders = vec![
+            msg("真正被撤回的", 2000),
+            msg("没被撤回的", 3000),
+        ];
+        let found = find_revoke_target(&notice, &orders, &[], "self", &HashMap::new())
+            .expect("应该精确找到 2000");
+        assert_eq!(found.content, "真正被撤回的");
+
+        // 原消息 2000 不在本批（例如在导入时段之外）→ 不匹配任何消息。
+        let orders = vec![msg("没被撤回的", 3000)];
+        assert!(
+            find_revoke_target(&notice, &orders, &[], "self", &HashMap::new()).is_none(),
+            "不能退而把 3000 当成撤回目标"
+        );
+
+        // `Some(0)`：有 newmsgid 但库里查不到原消息，同样不许猜。
+        let unresolved = MsgRow {
+            revoke_target: Some(0),
+            ..notice.clone()
+        };
+        assert!(
+            find_revoke_target(&unresolved, &orders, &[], "self", &HashMap::new()).is_none()
+        );
+
+        // 微信把撤回提示放在原消息的位置时，两条 sort 相同，也要精确命中。
+        let in_place = MsgRow {
+            sort: 2000,
+            ..notice.clone()
+        };
+        let orders = vec![msg("更早的", 1000), msg("被撤回的", 2000)];
+        let found = find_revoke_target(&in_place, &orders, &[], "self", &HashMap::new())
+            .expect("sort 相同也应该命中");
+        assert_eq!(found.content, "被撤回的");
+
+        // 没有 newmsgid 的旧式提示走名称匹配时，同样允许 sort 相同并优先取它。
+        let plain = MsgRow {
+            revoke_target: None,
+            ..in_place
+        };
+        let found = find_revoke_target(&plain, &orders, &[], "self", &HashMap::new())
+            .expect("旧式提示也应取 sort 相同的那条");
+        assert_eq!(found.content, "被撤回的");
+    }
+
+    /// 没有 newmsgid 的撤回提示不能拿本批新读到的上一条消息顶替：
+    /// 原消息撤回后已被微信替换掉，库里剩下的上一条其实是没撤回的。
+    #[test]
+    fn revoke_without_id_does_not_guess_from_current_batch() {
+        let order = MsgRow {
+            kind: "文字".to_string(),
+            nick: "顺顺顺顺顺顺".to_string(),
+            content: "15.20.25三中三40".to_string(),
+            time: "19:35".to_string(),
+            sort: 1795692907000,
+            chat: "57217918789@chatroom".to_string(),
+            sender: "wxid_btnfemgm2k9k12".to_string(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        let notice = MsgRow {
+            kind: "撤回".to_string(),
+            nick: "系统".to_string(),
+            content: "\"顺顺顺顺顺顺\" 撤回了一条消息".to_string(),
+            time: "19:35".to_string(),
+            sort: 1795692933000,
+            chat: "57217918789@chatroom".to_string(),
+            sender: String::new(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        // 本批里只有这条没撤回的消息 → 不记录。
+        assert!(
+            find_revoke_target(&notice, &[], &[order.clone()], "self", &HashMap::new())
+                .is_none(),
+            "不能把本批里的上一条消息当成撤回目标"
+        );
+        // 监控时原消息是之前已经读到的旧消息 → 可以命中。
+        let found = find_revoke_target(&notice, &[order], &[], "self", &HashMap::new())
+            .expect("旧消息里的原消息应该命中");
+        assert_eq!(found.content, "15.20.25三中三40");
     }
 
     #[test]
@@ -11554,6 +11915,7 @@ mod tests {
             sender: sender.into(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         }
     }
 
@@ -11792,25 +12154,69 @@ fn short_remaining(text: &str) -> &str {
     text.split_whitespace().next().unwrap_or(text)
 }
 
-/// 多行文本框的右键菜单：剪切 / 复制 / 粘贴 / 全选。
-/// `id` 必须是创建 `TextEdit` 时用 `.id(...)` 设置的那一个，才能读写它的光标与选区。
+/// 帧首记录当前聚焦文本框的选区。
+///
+/// 右键点进 TextEdit 会先按点击位置重设光标、清掉原选区；右键菜单里的
+/// 「复制 / 剪切」就无从下手。所以在任何 UI 绘制之前把上一帧的选区存下来，
+/// 菜单打开期间用它兜底。
+fn snapshot_focused_text_selection(ctx: &egui::Context) {
+    let Some(focused) = ctx.memory(|m| m.focused()) else {
+        return;
+    };
+    let Some(range) = egui::TextEdit::load_state(ctx, focused)
+        .and_then(|s| s.cursor.char_range())
+        .filter(|r| !r.is_empty())
+    else {
+        return;
+    };
+    ctx.data_mut(|d| d.insert_temp(text_sel_snapshot_id(), Some((focused, range))));
+}
+
+fn text_sel_snapshot_id() -> egui::Id {
+    egui::Id::unique("wv_text_selection_snapshot")
+}
+
+/// 文本框的右键菜单：剪切 / 复制 / 粘贴 / 全选。
+/// `id` 是 TextEdit 的控件 id（默认取 `response.id` 即可），用来读写光标与选区。
 fn text_edit_context_menu(
     ctx: &egui::Context,
     id: egui::Id,
     text: &mut String,
-    response: &egui::Response,
+    response: &mut egui::Response,
 ) {
+    let state = egui::TextEdit::load_state(ctx, id);
+    let current = state
+        .as_ref()
+        .and_then(|s| s.cursor.char_range())
+        .filter(|r| !r.is_empty());
+    let current_empty = current.is_none();
+    let menu_open = response.context_menu_opened();
+    // 右键按下 / 按住 / 松开：TextEdit 已经把选区清掉，允许用帧首快照兜底。
+    let right_click = response.secondary_clicked()
+        || ctx.input(|i| i.pointer.secondary_down());
+    let range = current.or_else(|| {
+        if menu_open || right_click {
+            ctx.data(|d| {
+                d.get_temp::<Option<(egui::Id, egui::text_selection::CCursorRange)>>(
+                    text_sel_snapshot_id(),
+                )
+            })
+            .flatten()
+            .filter(|(sid, _)| *sid == id)
+            .map(|(_, r)| r)
+        } else {
+            None
+        }
+    });
+
+    let mut edited = false;
     response.context_menu(|ui| {
         compact_context_menu(ui);
-        let state = egui::TextEdit::load_state(ctx, id);
-        let range = state
-            .as_ref()
-            .and_then(|s| s.cursor.char_range())
-            .map(|r| {
-                let a = r.primary.index.0.min(r.secondary.index.0);
-                let b = r.primary.index.0.max(r.secondary.index.0);
-                (a, b)
-            });
+        let range = range.map(|r| {
+            let a = r.primary.index.0.min(r.secondary.index.0);
+            let b = r.primary.index.0.max(r.secondary.index.0);
+            (a, b)
+        });
         let has_sel = range.is_some_and(|(a, b)| a < b);
         let selected = match range {
             Some((a, b)) if a < b => {
@@ -11829,6 +12235,7 @@ fn text_edit_context_menu(
             ui.ctx().copy_text(selected.clone());
             if let Some((a, b)) = range {
                 set_caret = Some(replace_chars(text, a, b, ""));
+                edited = true;
             }
             ui.close();
         }
@@ -11846,6 +12253,7 @@ fn text_edit_context_menu(
                     (n, n)
                 });
                 set_caret = Some(replace_chars(text, a, b, &pasted));
+                edited = true;
             }
             ui.close();
         }
@@ -11868,6 +12276,28 @@ fn text_edit_context_menu(
             st.store(ctx, id);
         }
     });
+    if edited {
+        // 菜单里的剪切 / 粘贴直接改了字符串，不会触发 TextEdit 自身的
+        // changed 标记；补上，依赖 changed() 的保存 / 过滤逻辑才会运行。
+        response.mark_changed();
+    }
+
+    // 菜单已关闭、也没有正在右键时，帧首快照就没用了；清掉，避免下次
+    // 在没有选区时误用上一轮的选区。
+    if current_empty && !menu_open && !right_click {
+        ctx.data_mut(|d| {
+            if d.get_temp::<Option<(egui::Id, egui::text_selection::CCursorRange)>>(
+                text_sel_snapshot_id(),
+            )
+            .flatten()
+            .is_some_and(|(sid, _)| sid == id)
+            {
+                d.remove_temp::<Option<(egui::Id, egui::text_selection::CCursorRange)>>(
+                    text_sel_snapshot_id(),
+                );
+            }
+        });
+    }
 }
 
 /// 把字符区间 `[a, b)` 换成 `with`，返回换完后光标应在的字符位置。
@@ -12303,10 +12733,20 @@ fn msg_row(
             )),
         }
     };
-    let bg = if is_info && selected {
-        GOLD_BG
-    } else if selected {
-        GREEN_TINT
+    // 选中行的底色比该状态的普通底色再深一档，和「成功绿底」区分开，
+    // 否则成功行被选中时看不出高亮。
+    let selected_bg = if is_image {
+        BLUE_HOVER
+    } else {
+        match status {
+            OrderStatus::Doubtful => Color32::from_rgb(0xCF, 0xE2, 0xF8),
+            OrderStatus::Failed => Color32::from_rgb(0xFF, 0xD8, 0xD3),
+            OrderStatus::Success => Color32::from_rgb(0xC9, 0xEB, 0xD8),
+            OrderStatus::Info => Color32::from_rgb(0xFF, 0xE4, 0xA6),
+        }
+    };
+    let bg = if selected {
+        selected_bg
     } else if resp.hovered() {
         tint.map_or(HOVER, |(_, hover)| hover)
     } else if let Some((normal, _)) = tint {
@@ -12354,8 +12794,9 @@ fn msg_row(
                 OrderStatus::Info => GOLD_FG,
             }
         };
+        // 选中标识竖线加粗到 3px，配合更深的选中底色，一眼能看出当前选中的是哪一条。
         ui.painter().rect_filled(
-            egui::Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height())),
+            egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
             CornerRadius::ZERO,
             bar,
         );
@@ -12547,89 +12988,74 @@ fn separator_line(ui: &mut egui::Ui, height: f32) {
     ui.painter().vline(rect.center().x, rect.y_range(), Stroke::new(1.0, BORDER));
 }
 
-/// 明细表六列宽度：彩种 / 玩法 / 内容 / 注数 / 单注 / 小计。
-/// 明细表列宽：每一列按「表头 + 该列所有内容」的最大宽度自适应，
-/// 单元格左右各 3px 内边距；剩余宽度全部给内容列。
-fn detail_widths(
-    ui: &egui::Ui,
-    avail: f32,
-    items: &[BetItem],
-    mul_sep: &str,
-) -> (f32, [f32; 6]) {
-    let header_font = FontId::proportional(12.5);
-    let body_font = FontId::proportional(13.5);
-    let measure = |text: &str, font: &FontId| {
-        ui.painter()
-            .layout_no_wrap(text.to_string(), font.clone(), Color32::PLACEHOLDER)
-            .size()
-            .x
-    };
-    let headers = ["彩种", "玩法", "内容", "注数", "单注", "小计"];
-    let mut inner = [0.0f32; 6];
-    for (i, h) in headers.iter().enumerate() {
-        inner[i] = measure(h, &header_font);
-    }
-    for item in items {
-        inner[0] = inner[0].max(measure(&item.lottery, &body_font));
-        inner[1] = inner[1].max(measure(&item.play, &body_font));
-        inner[2] = inner[2].max(detail_content_width(ui, &item.content, mul_sep));
-        inner[3] = inner[3].max(measure(&convert::fmt_amount(item.bets), &body_font));
-        inner[4] = inner[4].max(measure(&stake_amount_text(&item.stake), &body_font));
-        inner[5] = inner[5].max(measure(&fmt_money(item.amount), &body_font));
-    }
-    // 左右各 3px；+1 兜住字体度量的亚像素误差。
-    let pad = 6.0 + 1.0;
-    let mut widths = [0.0f32; 6];
-    for (i, w) in widths.iter_mut().enumerate() {
-        *w = (inner[i] + pad).max(24.0);
-    }
-    let total: f32 = widths.iter().sum();
-    let table_w = avail.max(total).max(380.0);
-    // 窗口比内容宽时，多出来的宽度给内容列，表格仍然铺满。
-    widths[2] += (table_w - total).max(0.0);
-    (table_w, widths)
+/// 明细表固定列宽：彩种 / 玩法 / 内容 / 注数 / 单注 / 小计。
+/// 改这里即可调整各列宽度；内容列超出后在列内换行，表格总宽 = 六列之和。
+const DETAIL_COL_WIDTHS: [f32; 6] = [45.0, 58.0, 156.0, 35.0, 35.0, 35.0];
+
+fn detail_widths() -> (f32, [f32; 6]) {
+    (DETAIL_COL_WIDTHS.iter().sum(), DETAIL_COL_WIDTHS)
 }
 
-/// 内容列按方块实际宽度测量：方块左右各 3px 内边距 + 左右各 1px 描边，
-/// 方块间距 3px。这里必须和 `detail_token_box` 的实际占宽一致，
-/// 否则内容列会比内容本身窄，尾部被裁掉。
-fn detail_content_width(ui: &egui::Ui, content: &str, mul_sep: &str) -> f32 {
-    let mut w = 0.0;
-    let mut n = 0usize;
-    for part in detail_content_parts(content, mul_sep) {
-        let piece = match part {
-            DetailContentPart::Token(t) => {
-                let color = detail_token_color(&t);
-                ui.painter()
-                    .layout_no_wrap(t, FontId::proportional(12.5), color)
-                    .size()
-                    .x
-                    + 8.0
-            }
-            DetailContentPart::Sep(s) => {
-                let (label, _) = detail_sep_display(&s);
-                ui.painter()
-                    .layout_no_wrap(
-                        label.to_string(),
-                        FontId::proportional(11.0),
-                        Color32::PLACEHOLDER,
-                    )
-                    .size()
-                    .x
-            }
-        };
-        w += piece;
-        n += 1;
+/// 明细表单行行高；内容换行时按行数翻倍，内容在单元格里垂直居中。
+const DETAIL_ROW_H: f32 = 26.0;
+
+fn detail_content_row_height(lines: usize) -> f32 {
+    DETAIL_ROW_H * lines.max(1) as f32
+}
+
+fn detail_part_width(ui: &egui::Ui, part: &DetailContentPart) -> f32 {
+    match part {
+        DetailContentPart::Token(t) => {
+            let color = detail_token_color(t);
+            ui.painter()
+                .layout_no_wrap(t.clone(), FontId::proportional(11.5), color)
+                .size()
+                .x
+                + 8.0
+        }
+        DetailContentPart::Sep(s) => {
+            let (label, _) = detail_sep_display(s);
+            ui.painter()
+                .layout_no_wrap(
+                    label.to_string(),
+                    FontId::proportional(10.0),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x
+        }
     }
-    if n > 1 {
-        w += 3.0 * (n - 1) as f32;
+}
+
+/// 内容列在给定列宽下会折成几行（与 `detail_content_cell` 的换行规则一致）。
+fn detail_content_lines(
+    ui: &egui::Ui,
+    content: &str,
+    mul_sep: &str,
+    width: f32,
+) -> usize {
+    // Frame 左右各 3px 内边距 + 各 1px 描边，内容可用宽度是 width - 8。
+    let max_w = (width - 8.0).max(10.0);
+    let mut lines = 1usize;
+    let mut x = 0.0f32;
+    for (i, part) in detail_content_parts(content, mul_sep).iter().enumerate() {
+        let piece = detail_part_width(ui, part);
+        if i > 0 {
+            if x + 3.0 + piece > max_w && x > 0.0 {
+                lines += 1;
+                x = 0.0;
+            } else {
+                x += 3.0;
+            }
+        }
+        x += piece;
     }
-    w
+    lines
 }
 
 fn detail_table_header(ui: &mut egui::Ui, widths: &[f32; 6]) {
     let total: f32 = widths.iter().sum();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 30.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 26.0), Sense::hover());
     ui.painter()
         .rect_filled(rect, CornerRadius::ZERO, HEAD_BG);
     ui.painter().hline(
@@ -12668,7 +13094,7 @@ fn detail_table_header(ui: &mut egui::Ui, widths: &[f32; 6]) {
                 Align2::CENTER_CENTER
             },
             t,
-            FontId::proportional(12.5),
+            FontId::proportional(11.5),
             SUB,
         );
         x += *w;
@@ -12682,8 +13108,9 @@ fn detail_table_row(
     mul_sep: &str,
 ) {
     let total: f32 = widths.iter().sum();
-    // 行高固定 34（比原来的 ~43 低约 10px；再矮会切到加粗字的上下沿）。
-    let row_h = 34.0;
+    // 内容列可能换行：按实际行数计算行高，其它列在变高的行里垂直居中。
+    let content_lines = detail_content_lines(ui, &item.content, mul_sep, widths[2]);
+    let row_h = detail_content_row_height(content_lines);
     let (rect, _resp) =
         ui.allocate_exact_size(Vec2::new(total, row_h), Sense::hover());
     let mut child = ui.new_child(
@@ -12693,23 +13120,30 @@ fn detail_table_row(
     );
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     child.spacing_mut().item_spacing.x = 0.0;
-    detail_text_cell(&mut child, widths[0], &item.lottery, TEXT, 13.5, true, row_h);
+    detail_text_cell(&mut child, widths[0], &item.lottery, TEXT, 12.5, true, row_h);
     detail_text_cell(
         &mut child,
         widths[1],
         &item.play,
         detail_play_color(&item.play),
-        13.5,
+        12.5,
         true,
         row_h,
     );
-    detail_content_cell(&mut child, widths[2], &item.content, mul_sep, row_h);
+    detail_content_cell(
+        &mut child,
+        widths[2],
+        &item.content,
+        mul_sep,
+        row_h,
+        content_lines,
+    );
     detail_text_cell(
         &mut child,
         widths[3],
         &convert::fmt_amount(item.bets),
         TEXT,
-        13.5,
+        12.5,
         true,
         row_h,
     );
@@ -12718,7 +13152,7 @@ fn detail_table_row(
         widths[4],
         &stake_amount_text(&item.stake),
         MONEY_BLUE,
-        13.5,
+        12.5,
         true,
         row_h,
     );
@@ -12727,7 +13161,7 @@ fn detail_table_row(
         widths[5],
         &fmt_money(item.amount),
         MONEY_RED,
-        13.5,
+        12.5,
         true,
         row_h,
     );
@@ -12797,31 +13231,34 @@ fn detail_content_cell(
     content: &str,
     mul_sep: &str,
     row_h: f32,
+    lines: usize,
 ) {
-    let inner_w = (width - 6.0).max(10.0);
+    let inner_w = (width - 8.0).max(10.0);
+    // Frame 占位不会走父布局的垂直居中（只按第一行的高度定位）。
+    // 先按行数算出整块内容的高度，再把整块内容放在上下剩余空间的正中间。
+    let line_h = detail_line_height(ui);
+    let content_h = line_h * lines as f32 + 2.0 * lines.saturating_sub(1) as f32;
+    let top = ((row_h - content_h) * 0.5).max(0.0);
     ui.allocate_ui_with_layout(
         Vec2::new(width, row_h),
-        Layout::left_to_right(Align::Center),
+        Layout::top_down(Align::Min),
         |ui| {
             ui.set_min_width(width);
             ui.set_max_width(width);
+            ui.add_space(top);
             egui::Frame::new()
                 .inner_margin(Margin::symmetric(3, 0))
                 .show(ui, |ui| {
                     ui.set_width(inner_w);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::ZERO;
-                        for (i, part) in
-                            detail_content_parts(content, mul_sep).into_iter().enumerate()
-                        {
-                            if i > 0 {
-                                ui.add_space(3.0);
-                            }
+                    // 内容超过列宽时自动换行，不会再把表格往右撑开。
+                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 2.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for part in detail_content_parts(content, mul_sep) {
                             match part {
                                 DetailContentPart::Token(t) => detail_token_box(ui, &t),
                                 DetailContentPart::Sep(s) => {
                                     let (label, color) = detail_sep_display(&s);
-                                    ui.label(RichText::new(label).size(11.0).color(color));
+                                    ui.label(RichText::new(label).size(10.0).color(color));
                                 }
                             }
                         }
@@ -12829,6 +13266,21 @@ fn detail_content_cell(
                 });
         },
     );
+}
+
+/// 换行布局里每一行的实际高度（至少是 `interact_size.y`，不是文字高度）。
+fn detail_line_height(ui: &egui::Ui) -> f32 {
+    let token_box_h = ui
+        .painter()
+        .layout_no_wrap(
+            "0".to_string(),
+            FontId::proportional(11.5),
+            Color32::PLACEHOLDER,
+        )
+        .size()
+        .y
+        + 2.0; // 方块上下各 1px 描边
+    ui.spacing().interact_size.y.max(token_box_h)
 }
 
 enum DetailContentPart {
@@ -12916,19 +13368,25 @@ fn detail_split_tokens(s: &str) -> Vec<String> {
 
 fn detail_token_box(ui: &mut egui::Ui, token: &str) {
     let color = detail_token_color(token);
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0xF2, 0xF6, 0xFC))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(0xC9, 0xD6, 0xE6)))
-        .corner_radius(CornerRadius::same(3))
-        // 内容方块上下不留额外空隙，行高才能压低。
-        .inner_margin(Margin::symmetric(3, 0))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(RichText::new(token).size(12.5).color(color))
-                    .extend()
-                    .selectable(false),
-            );
-        });
+    // 手动画方块而不用 Frame：Frame 通过 allocate_rect 占位，会绕过
+    // horizontal_wrapped 的换行判断，导致内容一多就冲出列宽。
+    let galley = ui.painter().layout_no_wrap(
+        token.to_string(),
+        FontId::proportional(11.5),
+        color,
+    );
+    // 与 detail_part_width 保持一致：文字 + 左右内边距 6 + 描边 2。
+    let size = galley.size() + Vec2::new(8.0, 2.0);
+    let (rect, _resp) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(3),
+        Color32::from_rgb(0xF2, 0xF6, 0xFC),
+        Stroke::new(1.0, Color32::from_rgb(0xC9, 0xD6, 0xE6)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + Vec2::new(4.0, 1.0), galley, color);
 }
 
 /// 明细「玩法」列的文字色：与中奖明细的玩法徽章用同一套颜色，未知玩法用默认文字色。
@@ -13496,27 +13954,7 @@ fn reconcile_bettor_card(ui: &mut egui::Ui, b: &reconcile::BettorDiff) {
                         .strong()
                         .color(BILL_TEXT),
                 );
-                egui::Grid::new(format!("rc_batch_{}", b.name))
-                    .num_columns(3)
-                    .spacing([18.0, 3.0])
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("#").size(10.5).color(MUTED));
-                        ui.label(RichText::new("本机").size(10.5).color(MUTED));
-                        ui.label(RichText::new("对方").size(10.5).color(MUTED));
-                        ui.end_row();
-                        for row in &b.batches {
-                            ui.label(
-                                RichText::new(row.no.to_string())
-                                    .size(10.5)
-                                    .color(CELL_NO),
-                            );
-                            ui.label(RichText::new(&row.local).size(10.5).color(BILL_TEXT));
-                            ui.label(
-                                RichText::new(&row.remote).size(10.5).color(BILL_TEXT),
-                            );
-                            ui.end_row();
-                        }
-                    });
+                reconcile_batch_table(ui, &format!("rc_batch_{}", b.name), &b.batches);
             }
             match b.status {
                 Status::LocalOnly => {
@@ -13536,6 +13974,51 @@ fn reconcile_bettor_card(ui: &mut egui::Ui, b: &reconcile::BettorDiff) {
                 _ => {}
             }
         });
+}
+
+/// 「逐批差异」带线表格：外框 + 列线 + 行线，比裸 Grid 更容易对齐阅读。
+fn reconcile_batch_table(ui: &mut egui::Ui, id: &str, rows: &[reconcile::BatchRow]) {
+    let line = Stroke::new(1.0, BORDER);
+    // 单元格内边距；每行高度由文字 + 上下内边距决定。
+    let pad = Margin::symmetric(6, 3);
+    let mut rects: Vec<egui::Rect> = Vec::new();
+    let grid = egui::Grid::new(id)
+        .num_columns(3)
+        .spacing([0.0, 0.0])
+        .show(ui, |ui| {
+            let mut cell = |ui: &mut egui::Ui, text: &str, color: Color32| {
+                let resp = egui::Frame::new()
+                    .inner_margin(pad)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(text).size(10.5).color(color));
+                    })
+                    .response;
+                rects.push(resp.rect);
+            };
+            cell(ui, "#", MUTED);
+            cell(ui, "本机", MUTED);
+            cell(ui, "对方", MUTED);
+            ui.end_row();
+            for row in rows {
+                cell(ui, &row.no.to_string(), CELL_NO);
+                cell(ui, &row.local, BILL_TEXT);
+                cell(ui, &row.remote, BILL_TEXT);
+                ui.end_row();
+            }
+        });
+    let rect = grid.response.rect;
+    let painter = ui.painter();
+    painter.rect_stroke(rect, CornerRadius::ZERO, line, egui::StrokeKind::Inside);
+    if rects.len() >= 3 {
+        // 单元格不填满列宽，列线取下一列的起始 x（Grid 间距为 0）。
+        for col in 1..3 {
+            painter.vline(rects[col].min.x, rect.y_range(), line);
+        }
+        // 行线取每一行第一个单元格的顶边。
+        for row_start in (3..rects.len()).step_by(3) {
+            painter.hline(rect.x_range(), rects[row_start].min.y, line);
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -15281,7 +15764,13 @@ fn revoke_actor(content: &str) -> Option<String> {
     }
 }
 
-/// 找被撤回的那一条：同会话、在撤回提示之前、发送人匹配，取最近一条。
+/// 找被撤回的那一条。
+///
+/// - 撤回提示带原消息 id（`revoke_target`）时：在旧消息 + 本批里精确找，找不到就
+///   放弃，绝不猜。
+/// - 没有 id 时（不少微信版本就是这样）：**只在旧消息（之前导入 / 监控到的）里**
+///   按「同会话、撤回提示之前、发送人匹配」取最近一条。本批新读到的消息不能当
+///   候选——原消息被撤回后会被微信替换掉，本批里还留着的上一条并不是它。
 ///
 /// 群聊按撤回提示里的昵称匹配；单聊按「不是自己」的那一方匹配；
 /// `你撤回了一条消息` 匹配自己。
@@ -15292,11 +15781,30 @@ fn find_revoke_target(
     self_wxid: &str,
     name_to_usr: &HashMap<String, String>,
 ) -> Option<MsgRow> {
+    // 撤回提示解析出了原消息 id：只认这一条。**找不到就返回 None**，
+    // 不能退而匹配「同发送人最近一条」——原消息可能在导入时段之外，
+    // 那样会把一条没撤回的消息误记成已撤回。
+    if let Some(target_sort) = revoke.revoke_target {
+        if target_sort <= 0 {
+            return None;
+        }
+        // 不再要求 `m.sort < revoke.sort`：微信常把撤回提示放在原消息的位置，
+        // 两条的 sort 可能相同（甚至提示略靠前）；id 匹配是权威的。
+        return orders
+            .iter()
+            .chain(batch.iter())
+            .find(|m| {
+                m.chat == revoke.chat && m.sort == target_sort && m.kind != "撤回"
+            })
+            .cloned();
+    }
     let actor = revoke_actor(&revoke.content);
     let is_group = revoke.chat.ends_with("@chatroom");
     let mut best: Option<&MsgRow> = None;
-    for m in orders.iter().chain(batch.iter()) {
-        if m.chat != revoke.chat || m.sort >= revoke.sort {
+    // 只查旧消息：本批新读到的上一条不是被撤回的那条（原消息已被替换掉）。
+    for m in orders {
+        // 允许 sort 相同：撤回提示可能就放在原消息的位置上。
+        if m.chat != revoke.chat || m.sort > revoke.sort {
             continue;
         }
         if matches!(m.kind.as_str(), "撤回" | "系统") {

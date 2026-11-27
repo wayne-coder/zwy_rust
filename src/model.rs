@@ -119,6 +119,10 @@ pub struct MsgRow {
     pub link_url: Option<String>,
     /// 「引用」类型消息里被引用的原文。
     pub quote: Option<QuoteRef>,
+    /// 撤回提示指向的原消息 sort（从 revokemsg 的 newmsgid 精确查到）。
+    /// `None` = 不是撤回提示，或旧库没有 server_id（退回名称匹配）；
+    /// `Some(0)` = 有 newmsgid 但原消息不在库里，此时不能再猜别的消息。
+    pub revoke_target: Option<i64>,
 }
 
 pub struct ImportResult {

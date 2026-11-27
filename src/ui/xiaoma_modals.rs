@@ -200,11 +200,12 @@ pub fn deduct_body(xm: &mut XmDeduct, rows: &[XiaoMaRow], ui: &mut egui::Ui) {
     let mut copy_all = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new("过滤条件").size(12.0).color(SUB));
-        let resp = ui.add(
+        let mut resp = ui.add(
             egui::TextEdit::singleline(&mut xm.deduct_threshold)
                 .desired_width(120.0)
                 .hint_text("例如：10"),
         );
+        super::text_edit_context_menu(ui.ctx(), resp.id, &mut xm.deduct_threshold, &mut resp);
         if xm.deduct_focus_pending {
             resp.request_focus();
             xm.deduct_focus_pending = false;

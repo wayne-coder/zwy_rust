@@ -168,6 +168,7 @@ mod tests {
             sender: sender.into(),
             link_url: None,
             quote: None,
+            revoke_target: None,
         }
     }
 

@@ -847,8 +847,15 @@ pub fn evaluate(bet: &BetItem, draw: &RegionDraw, mul_sep: &str, odds: &OddsSet)
             match cat {
                 Cat::Combo2 | Cat::TwoAllHit => {
                     let units = unit(size);
+                    let normal_multiplier = if cat == Cat::TwoAllHit {
+                        odds.value("two_all_hit")
+                    } else {
+                        odds.value("two_in_two")
+                    };
+                    let dai_multiplier = odds.value("two_in_two_dai_kan");
                     // 二中二带砍：一对号码里一个特码 + 一个平码。二全中永不带砍。
-                    let dai_units = if cat == Cat::Combo2 {
+                    // 带砍赔率配成 0 = 不做带砍，既不算中奖注额也不显示这一项。
+                    let dai_units = if cat == Cat::Combo2 && dai_multiplier > 0.0 {
                         if let Some(groups) = exact_drag {
                             drag_special_pairs(groups, special, &draw6)
                         } else if covered_set.contains(&special) {
@@ -860,12 +867,6 @@ pub fn evaluate(bet: &BetItem, draw: &RegionDraw, mul_sep: &str, odds: &OddsSet)
                         0.0
                     };
                     if units + dai_units > 0.0 {
-                        let normal_multiplier = if cat == Cat::TwoAllHit {
-                            odds.value("two_all_hit")
-                        } else {
-                            odds.value("two_in_two")
-                        };
-                        let dai_multiplier = odds.value("two_in_two_dai_kan");
                         ev.hit = true;
                         ev.win_stake = ((units + dai_units) * per_bet).min(amount);
                         ev.win_amount = units * per_bet * normal_multiplier
@@ -1168,6 +1169,24 @@ mod more_tests {
         assert!(e.parts.iter().any(|(l, s, od)| {
             l == "二中二带砍" && (*s - 20.0).abs() < 1e-9 && (*od - 100.0).abs() < 1e-9
         }));
+    }
+
+    #[test]
+    fn zero_da_kan_odds_is_not_shown() {
+        let d = draw(&[1, 2, 3, 4, 5, 6], 7);
+        let mut o = OddsSet::default();
+        if let Some(v) = o.value_mut("two_in_two_dai_kan") {
+            *v = 0.0;
+        }
+        // 01 平码 + 07 特码：只中带砍。带砍赔率 0 → 不算中奖，也不产生带砍段。
+        let e = evaluate(&bet("二中二", "01,07", 10.0, 1.0), &d, "拖", &o);
+        assert!(!e.hit);
+        assert!(e.parts.is_empty());
+
+        // 普通二中二仍正常结算，且不会出现「二中二带砍」。
+        let e = evaluate(&bet("二中二", "01,02", 10.0, 1.0), &d, "拖", &o);
+        assert!(e.hit);
+        assert!(e.parts.iter().all(|(l, _, _)| l != "二中二带砍"));
     }
 
     #[test]

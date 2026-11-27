@@ -1,4 +1,4 @@
-# 账无忧 · 订单消息助手
+# 小掌柜 · 订单消息助手
 
 Windows 桌面工具：读取当前已登录微信 4.x 的本地数据库，按选定的会员与时间段
 把聊天消息整理成「注单消息」列表，并在所选时段内**自动追加新消息**。
@@ -9,7 +9,7 @@ Windows 桌面工具：读取当前已登录微信 4.x 的本地数据库，按�
 
 ## 运行
 
-直接双击 **`账无忧.exe`**。
+直接双击 **`小掌柜.exe`**。
 
 - 需要**微信已登录并保持运行**（首次读取要从微信进程内存提取数据库密钥）。
 - 首次读取约 3 秒；之后命中 DPAPI 加密的密钥缓存，约 0.3 秒。
@@ -31,7 +31,7 @@ Windows 桌面工具：读取当前已登录微信 4.x 的本地数据库，按�
   - `设置`：`关键词`、`替换词`、`赔率`、`信息码`、`权限`（查看账号 / 到期时间，
     修改密码、退出登录）。
 
-- 窗口标题显示 `账无忧 v版本号 · 账号 · 剩余时间`。
+- 窗口标题显示 `小掌柜 v版本号 · 账号 · 剩余时间`。
 - **左侧**：常驻「注单消息」列表（没有内容时显示空状态）。
   每行格式：`类型 | 昵称 | 内容（超过 10 个字省略为 …） | 时间（如 2:06）`。
   - 类型：文字 / 图片 / 语音 / 视频 / 表情 / 链接 / 系统 等；
@@ -136,9 +136,9 @@ PowerShell：
 ```powershell
 $env:PATH = "D:\A-Wayen\project\zwy_rust\tools\msys64\mingw64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 cargo build --release
-Copy-Item target\release\wechat_viewer.exe "账无忧.exe"
+Copy-Item target\release\wechat_viewer.exe "小掌柜.exe"
 
-cp target/release/wechat_viewer.exe 账无忧.exe
+cp target/release/wechat_viewer.exe 小掌柜.exe
 ```
 
 产物：`target\release\wechat_viewer.exe`（静态链接，只依赖 Windows 系统 DLL）。
@@ -149,9 +149,9 @@ cp target/release/wechat_viewer.exe 账无忧.exe
 ### 自检 / 调试
 
 ```powershell
-.\账无忧.exe --selftest
-.\账无忧.exe --import-test <会话ID> [日期] [开始时间] [结束时间] [since_sort]
-# 例：.\账无忧.exe --import-test 58545017002@chatroom 2026-11-20 19:00 20:00
+.\小掌柜.exe --selftest
+.\小掌柜.exe --import-test <会话ID> [日期] [开始时间] [结束时间] [since_sort]
+# 例：.\小掌柜.exe --import-test 58545017002@chatroom 2026-11-20 19:00 20:00
 # 传 since_sort（毫秒）可验证实时监控使用的增量查询
 ```
 
@@ -170,7 +170,7 @@ cp target/release/wechat_viewer.exe 账无忧.exe
 | 文件 | 职责 |
 | --- | --- |
 | `src/main.rs` | 程序入口、窗口、`--selftest` / `--import-test` |
-| `src/ui.rs` | 账无忧主页、选定会员页、会员分组、导入弹窗、注单列表 |
+| `src/ui.rs` | 小掌柜主页、选定会员页、会员分组、导入弹窗、注单列表 |
 | `src/groups.rs` | 会员分组的本地持久化与注单过滤匹配 |
 | `src/loader.rs` | 加载编排：定位 → 密钥 → 解密 → 联系人/群聊/头像 |
 | `src/messages.rs` | 消息表定位、正文解码、时段过滤、实时增量监控 |
