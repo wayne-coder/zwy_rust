@@ -696,9 +696,13 @@ fn rebate_rate(play: &str, odds: &OddsSet) -> f64 {
     }
 }
 
-/// 一条组合注展开后的全部组合（去重）。拖注（互碰）按每段各出一个号。
+/// 一条组合注展开后的全部组合。拖注（互碰）按每段各出一个号。
+///
+/// 拖注的组合数必须与转换时的 `bets`（`settle::distinct_drag_count`）完全一致：
+/// 各段号码有重叠时，同一注里出现两个相同号码是无效组合，要跳过——否则
+/// 「小码总投注」会比注单金额多出来（例：`8尾拖蛇拖虎` 会多算 4 注）。
 fn bet_combos(bet: &BetItem, size: usize, mul_sep: &str) -> Vec<Vec<u32>> {
-    let mut out: BTreeSet<Vec<u32>> = BTreeSet::new();
+    let mut out: Vec<Vec<u32>> = Vec::new();
     if !mul_sep.is_empty() && bet.content.contains(mul_sep) {
         let groups: Vec<Vec<u32>> = bet
             .content
@@ -709,32 +713,36 @@ fn bet_combos(bet: &BetItem, size: usize, mul_sep: &str) -> Vec<Vec<u32>> {
             for_each_drag(&groups, &mut |combo| {
                 let mut combo = combo.to_vec();
                 combo.sort_unstable();
-                out.insert(combo);
+                out.push(combo);
             });
-            return out.into_iter().collect();
+            return out;
         }
     }
     let covered = covered_numbers(&bet.content);
     for combo in combinations(&covered, size) {
-        out.insert(combo);
+        out.push(combo);
     }
-    out.into_iter().collect()
+    out
 }
 
+/// 枚举拖注的全部有效组合：每段各出一个号，同一注里号码不能重复。
 fn for_each_drag(groups: &[Vec<u32>], f: &mut impl FnMut(&[u32])) {
-    let mut cur = Vec::with_capacity(groups.len());
-    fn walk(groups: &[Vec<u32>], i: usize, cur: &mut Vec<u32>, f: &mut impl FnMut(&[u32])) {
+    fn walk(groups: &[Vec<u32>], i: usize, used: &mut Vec<u32>, f: &mut impl FnMut(&[u32])) {
         if i == groups.len() {
-            f(cur);
+            f(used);
             return;
         }
         for n in &groups[i] {
-            cur.push(*n);
-            walk(groups, i + 1, cur, f);
-            cur.pop();
+            if used.contains(n) {
+                continue;
+            }
+            used.push(*n);
+            walk(groups, i + 1, used, f);
+            used.pop();
         }
     }
-    walk(groups, 0, &mut cur, f);
+    let mut used = Vec::new();
+    walk(groups, 0, &mut used, f);
 }
 
 // ── 中奖概率 ──────────────────────────────────────────────────────────────
@@ -962,6 +970,47 @@ mod tests {
         // 没吃码的号：金额不变，但整区总额变小 → 风险跟着变。
         assert!((row2.stake - 50.0).abs() < 1e-9);
         assert!((row2.risk - (base - 50.0 * 47.0)).abs() < 1e-9);
+    }
+
+    /// 拖注各段号码有重叠时，同一注里出现两个相同号码是无效组合：转换时
+    /// （`settle::distinct_drag_count`）已经不算这一注，风险页也必须跳过，
+    /// 否则「小码总投注」会比注单金额多出来（真实例子：`8尾拖蛇拖虎`）。
+    ///
+    /// `(01,02)拖(02,03)拖(03,04)`：2×2×2 = 8 条路径，去掉重复号后只剩 4 注。
+    #[test]
+    fn xiaoma_drag_skips_repeated_numbers_in_one_combo() {
+        let b = bet("三中三", "(01,02)拖(02,03)拖(03,04)", 40.0, 4.0);
+        assert_eq!(
+            bet_combos(&b.bet, 3, "拖"),
+            vec![
+                vec![1, 2, 3],
+                vec![1, 2, 4],
+                vec![1, 3, 4],
+                vec![2, 3, 4],
+            ]
+        );
+        let rows = xiaoma(&[b.clone()], &draws(), &OddsConfig::default(), None, "拖");
+        let total: f64 = rows.iter().map(|r| r.stake).sum();
+        assert!(
+            (total - b.bet.amount).abs() < 1e-6,
+            "风险合计 {total} ≠ 注单金额 {}",
+            b.bet.amount
+        );
+        // 概率统计的总注数也按 4 注算，与金额一致。
+        let stats = play_stats(&[b], None, "拖");
+        assert_eq!(stats[0].total_bets, 4);
+        assert_eq!(stats[0].distinct, 4);
+    }
+
+    /// 不重叠的拖注仍按每段互碰展开，金额与注单一致。
+    #[test]
+    fn xiaoma_drag_without_overlap_keeps_full_cross_product() {
+        let b = bet("三中三", "(01,02)拖(03,04)拖(05,06)", 80.0, 8.0);
+        assert_eq!(bet_combos(&b.bet, 3, "拖").len(), 8);
+        let rows = xiaoma(&[b], &draws(), &OddsConfig::default(), None, "拖");
+        assert_eq!(rows.len(), 8);
+        let total: f64 = rows.iter().map(|r| r.stake).sum();
+        assert!((total - 80.0).abs() < 1e-6, "{total}");
     }
 
     #[test]

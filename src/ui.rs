@@ -1362,11 +1362,16 @@ impl ViewerApp {
         // 也必须留在候选池里，否则重新导入时会误把更早的同发送人消息当成
         // 撤回目标，导致「已撤回」越导入越多。
         let batch_seen = revoke_candidates(&rows);
-        // 本次导入之前已经在列表里的消息（监控/上一次导入）。
-        // 撤回目标的「按名字猜」只允许在这些旧消息里找：本批新读到的消息如果
-        // 是撤回目标，它已经被微信替换成撤回提示、不会还留在库里；还留在
-        // 库里的上一条并不是被撤回的那条，不能拿来顶替。
-        let prior_orders: Vec<MsgRow> = self.orders.clone();
+        // 撤回目标的「按名字猜」只允许在旧消息里找：本批新读到的消息如果是
+        // 撤回目标，它已经被微信替换成撤回提示、不会还留在库里；还留在库里的
+        // 上一条并不是被撤回的那条，不能拿来顶替。
+        //
+        // 候选 = 本次导入之前已经在列表里的消息（监控/上一次导入）+ 本地
+        // 「已撤回」记录里的原消息。后者让同一条提示被重复处理（监控每次回看、
+        // 重新导入）时保持幂等：原消息已从列表移除，仍能重新命中已记录的那条，
+        // 不会退而误伤同发送人更早的普通消息。
+        let mut prior_candidates: Vec<MsgRow> = self.orders.clone();
+        prior_candidates.extend(revoked_candidates(&self.revoked));
         let (self_wxid, name_to_usr) = match &self.state {
             State::Ready(d) => {
                 // 撤回提示里的名字可能是备注名，也可能是群昵称：两种都映射到 username。
@@ -1397,7 +1402,7 @@ impl ViewerApp {
             if r.kind == "撤回" {
                 self.handle_revoke(
                     &r,
-                    &prior_orders,
+                    &prior_candidates,
                     &batch_seen,
                     &self_wxid,
                     &name_to_usr,
@@ -1466,13 +1471,13 @@ impl ViewerApp {
     fn handle_revoke(
         &mut self,
         revoke: &MsgRow,
-        prior_orders: &[MsgRow],
+        prior_candidates: &[MsgRow],
         batch_seen: &[MsgRow],
         self_wxid: &str,
         name_to_usr: &HashMap<String, String>,
     ) {
         let Some(target) =
-            find_revoke_target(revoke, prior_orders, batch_seen, self_wxid, name_to_usr)
+            find_revoke_target(revoke, prior_candidates, batch_seen, self_wxid, name_to_usr)
         else {
             return;
         };
@@ -1577,7 +1582,11 @@ impl ViewerApp {
         let range_changed = self.monitor_range != Some(range);
 
         // 导入时段已经结束：不再启动监控，否则时段外的消息会被追加。
-        if Local::now().timestamp() > end_ts {
+        // 多留一个撤回窗口：时段末尾发出的注单可能到点之后才被撤回，监控
+        // 需要多跑一会儿才能接住这条撤回提示（主消息仍受 end_ts 限制）。
+        if Local::now().timestamp()
+            > end_ts.saturating_add(crate::messages::REVOKE_WINDOW_SECS)
+        {
             if self.monitor_rx.is_some() || self.monitor_stop.is_some() {
                 self.stop_monitor();
             }
@@ -11943,7 +11952,8 @@ mod tests {
     use super::{
         check_draw_row, clear_orders, detail_content_lines, find_quote_in_rows,
         find_quoted_image_index, find_revoke_target, group_filters, parse_draw_paste,
-        quote_match_score, revoke_actor, revoke_candidates, source_from_groups,
+        quote_match_score, revoke_actor, revoke_candidates, revoke_key_of,
+        revoked_candidates, source_from_groups,
     };
     use crate::model::{MemberGroup, MsgRow, QuoteRef};
     use eframe::egui;
@@ -12552,6 +12562,154 @@ mod tests {
         let found = find_revoke_target(&notice, &[order], &[], "self", &HashMap::new())
             .expect("旧消息里的原消息应该命中");
         assert_eq!(found.content, "15.20.25三中三40");
+    }
+
+    /// 没有 id 时，微信把撤回提示放在原消息的位置（和原消息同 sort）。首次
+    /// 导入时原消息只在本批里，必须按同 sort 匹配掉，否则聊天框里已经看不到
+    /// 的注单会留在「未撤回」。
+    #[test]
+    fn revoke_without_id_matches_same_sort_original_in_batch() {
+        let row = |content: &str, sender: &str, nick: &str, sort: i64| MsgRow {
+            kind: "文字".to_string(),
+            nick: nick.to_string(),
+            content: content.to_string(),
+            time: "21:00".to_string(),
+            sort,
+            chat: "g1@chatroom".to_string(),
+            sender: sender.to_string(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        let notice = MsgRow {
+            kind: "撤回".to_string(),
+            nick: "系统".to_string(),
+            content: "\"张三\" 撤回了一条消息".to_string(),
+            time: "21:00".to_string(),
+            sort: 2000,
+            chat: "g1@chatroom".to_string(),
+            sender: String::new(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        let earlier = row("更早的普通消息", "u1", "张三", 1500);
+        let original = row("被撤回的注单", "u1", "张三", 2000);
+        let found = find_revoke_target(
+            &notice,
+            &[],
+            &[earlier, original],
+            "self",
+            &HashMap::new(),
+        )
+        .expect("同 sort 的原消息应该命中");
+        assert_eq!(found.content, "被撤回的注单");
+
+        // 同 sort 但发送人对不上（同毫秒的别人的消息）：不能拿来顶替。
+        let other = row("李四的注单", "u2", "李四", 2000);
+        assert!(
+            find_revoke_target(&notice, &[], &[other], "self", &HashMap::new()).is_none(),
+            "同 sort 但不是同一发送人，不能当成撤回目标"
+        );
+    }
+
+    /// 监控回看会重复投递同一条撤回提示（覆盖 sort 不前进的回填提示）。
+    /// 原消息已经从列表移除，只有把「已撤回」记录放进候选池才能幂等命中，
+    /// 否则会退而匹配同发送人更早的普通消息，把它误记成已撤回。
+    #[test]
+    fn revoke_replay_matches_recorded_original() {
+        let row = |content: &str, sort: i64| MsgRow {
+            kind: "文字".to_string(),
+            nick: "张三".to_string(),
+            content: content.to_string(),
+            time: "21:00".to_string(),
+            sort,
+            chat: "g1@chatroom".to_string(),
+            sender: "u1".to_string(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        let earlier = row("更早的普通消息", 1500);
+        let recorded = row("被撤回的注单", 2000);
+        let notice = MsgRow {
+            kind: "撤回".to_string(),
+            nick: "系统".to_string(),
+            content: "\"张三\" 撤回了一条消息".to_string(),
+            time: "21:05".to_string(),
+            sort: 5000,
+            chat: "g1@chatroom".to_string(),
+            sender: String::new(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        let mut revoked = HashMap::new();
+        revoked.insert(
+            revoke_key_of(&recorded),
+            crate::revoked::RevokedRow {
+                sort: recorded.sort,
+                chat: recorded.chat.clone(),
+                sender: recorded.sender.clone(),
+                time: recorded.time.clone(),
+                nick: recorded.nick.clone(),
+                kind: recorded.kind.clone(),
+                content: recorded.content.clone(),
+            },
+        );
+
+        // 已撤回的原消息已经从注单列表移除，列表里只剩更早的那条。
+        let mut candidates = vec![earlier];
+        candidates.extend(revoked_candidates(&revoked));
+        let found = find_revoke_target(&notice, &candidates, &[], "self", &HashMap::new())
+            .expect("应该重新命中已记录的原消息");
+        assert_eq!(found.content, "被撤回的注单");
+        assert_eq!(found.sort, 2000);
+
+        // 对照：没有「已撤回」记录时，同发送人更早的普通消息会被误当成目标，
+        // 所以重复处理提示时必须把已记录的原消息留在候选池里。
+        let plain = vec![row("更早的普通消息", 1500)];
+        let wrong = find_revoke_target(&notice, &plain, &[], "self", &HashMap::new())
+            .expect("没有记录时只能猜到更早的那条");
+        assert_eq!(wrong.content, "更早的普通消息");
+    }
+
+    /// 同一会话同一 sort 有多条（同毫秒消息）时，带 id 的匹配也要用撤回人
+    /// 再筛一次，不能碰巧取到别人的消息。
+    #[test]
+    fn revoke_target_id_prefers_matching_sender_on_sort_collision() {
+        let row = |content: &str, sender: &str, nick: &str| MsgRow {
+            kind: "文字".to_string(),
+            nick: nick.to_string(),
+            content: content.to_string(),
+            time: "21:00".to_string(),
+            sort: 2000,
+            chat: "g1@chatroom".to_string(),
+            sender: sender.to_string(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        };
+        let notice = MsgRow {
+            kind: "撤回".to_string(),
+            nick: "系统".to_string(),
+            content: "\"张三\" 撤回了一条消息".to_string(),
+            time: "21:01".to_string(),
+            sort: 2000,
+            chat: "g1@chatroom".to_string(),
+            sender: String::new(),
+            link_url: None,
+            quote: None,
+            revoke_target: Some(2000),
+        };
+        // 李四的消息排在前面；按 id 会先命中它，按撤回人应改取张三的。
+        let rows = vec![
+            row("李四的注单", "u2", "李四"),
+            row("张三的注单", "u1", "张三"),
+        ];
+        let found = find_revoke_target(&notice, &rows, &[], "self", &HashMap::new())
+            .expect("应该命中张三的消息");
+        assert_eq!(found.content, "张三的注单");
     }
 
     #[test]
@@ -16517,6 +16675,32 @@ fn revoke_candidates(rows: &[MsgRow]) -> Vec<MsgRow> {
         .collect()
 }
 
+/// 本地「已撤回」记录还原成消息行，作为撤回匹配的候选。
+///
+/// 监控会回看最近一段时间的撤回提示（包括 sort 不前进的回填提示），同一条
+/// 提示会被重复处理。原消息此时已经从注单列表移除，只有把「已撤回」记录也
+/// 放进候选池，才能重新命中已记录的那条，保持重复处理幂等，不会误伤更早的
+/// 同发送人消息。
+fn revoked_candidates(
+    revoked: &HashMap<crate::revoked::RevokeKey, crate::revoked::RevokedRow>,
+) -> Vec<MsgRow> {
+    revoked
+        .values()
+        .map(|r| MsgRow {
+            kind: r.kind.clone(),
+            nick: r.nick.clone(),
+            content: r.content.clone(),
+            time: r.time.clone(),
+            sort: r.sort,
+            chat: r.chat.clone(),
+            sender: r.sender.clone(),
+            link_url: None,
+            quote: None,
+            revoke_target: None,
+        })
+        .collect()
+}
+
 /// 从撤回提示里取撤回人昵称：`"张三" 撤回了一条消息` → `张三`。
 fn revoke_actor(content: &str) -> Option<String> {
     let text = content.trim();
@@ -16534,16 +16718,56 @@ fn revoke_actor(content: &str) -> Option<String> {
     }
 }
 
-/// 找被撤回的那一条。
-///
-/// - 撤回提示带原消息 id（`revoke_target`）时：在旧消息 + 本批里精确找，找不到就
-///   放弃，绝不猜。
-/// - 没有 id 时（不少微信版本就是这样）：**只在旧消息（之前导入 / 监控到的）里**
-///   按「同会话、撤回提示之前、发送人匹配」取最近一条。本批新读到的消息不能当
-///   候选——原消息被撤回后会被微信替换掉，本批里还留着的上一条并不是它。
+/// 撤回提示里的撤回人是否就是这条消息的发送人。
 ///
 /// 群聊按撤回提示里的昵称匹配；单聊按「不是自己」的那一方匹配；
 /// `你撤回了一条消息` 匹配自己。
+fn revoke_sender_matches(
+    revoke: &MsgRow,
+    m: &MsgRow,
+    self_wxid: &str,
+    name_to_usr: &HashMap<String, String>,
+) -> bool {
+    let actor = revoke_actor(&revoke.content);
+    let is_group = revoke.chat.ends_with("@chatroom");
+    let actor_is_self = |name: &str| {
+        name == "你"
+            || (!self_wxid.is_empty()
+                && name_to_usr.get(name).is_some_and(|usr| *usr == self_wxid))
+    };
+    match actor.as_deref() {
+        Some(name) => {
+            if actor_is_self(name) {
+                !self_wxid.is_empty() && m.sender == self_wxid
+            } else if is_group {
+                // 备注名 / 群昵称可能对不上：再用「显示名 → username」兜一次。
+                m.nick == name
+                    || name_to_usr
+                        .get(name)
+                        .is_some_and(|usr| *usr == m.sender)
+            } else {
+                !self_wxid.is_empty() && m.sender != self_wxid
+            }
+        }
+        None => !is_group && !self_wxid.is_empty() && m.sender != self_wxid,
+    }
+}
+
+/// 找被撤回的那一条。
+///
+/// 目标是让「未撤回」和微信聊天框里看到的消息一致：聊天框里已经变成撤回提示的
+/// 原消息，不能留在未撤回列表里。
+///
+/// - 撤回提示带原消息 id（`revoke_target`）时：在旧消息 + 本批里精确找，找不到就
+///   放弃，绝不猜。同一会话同一 sort 有多条时（同毫秒消息），再用撤回人筛一次，
+///   避免把别的消息当成撤回目标。
+/// - 没有 id 时：先按微信回填提示的确定性线索匹配——**同会话、sort 相同、发送人
+///   对得上**。微信把撤回提示放在原消息的位置，提示和原消息共用同一个 sort；
+///   原消息可能在本批（首次导入），也可能在旧消息里（监控）。
+/// - 同 sort 命不中时，才退回「只在旧消息里按发送人取最近一条」。本批里其他
+///   sort 的消息不能当候选——原消息被撤回后聊天框里已经看不到它，本批里还留着
+///   的上一条是另一条正常消息（真实误判案例见
+///   `revoke_without_id_does_not_guess_from_current_batch`）。
 fn find_revoke_target(
     revoke: &MsgRow,
     orders: &[MsgRow],
@@ -16560,18 +16784,38 @@ fn find_revoke_target(
         }
         // 不再要求 `m.sort < revoke.sort`：微信常把撤回提示放在原消息的位置，
         // 两条的 sort 可能相同（甚至提示略靠前）；id 匹配是权威的。
-        return orders
+        let hits: Vec<&MsgRow> = orders
             .iter()
             .chain(batch.iter())
-            .find(|m| {
+            .filter(|m| {
                 m.chat == revoke.chat && m.sort == target_sort && m.kind != "撤回"
             })
-            .cloned();
+            .collect();
+        // 正常只有一条；万一同一毫秒有多条，按撤回人再筛，筛不出来才退回第一条。
+        for m in &hits {
+            if revoke_sender_matches(revoke, m, self_wxid, name_to_usr) {
+                return Some((*m).clone());
+            }
+        }
+        return hits.first().map(|m| (*m).clone());
     }
-    let actor = revoke_actor(&revoke.content);
-    let is_group = revoke.chat.ends_with("@chatroom");
+    // 没有 id：微信把提示回填到原消息的位置时，提示与原消息 sort 相同。
+    // 这是没有 id 时唯一确定性的对应关系，旧消息和本批都要查——首次导入时
+    // 原消息只在本批里，漏掉它就会把聊天框里已经看不到的注单留在未撤回。
+    for m in orders.iter().chain(batch.iter()) {
+        if m.chat != revoke.chat || m.sort != revoke.sort {
+            continue;
+        }
+        if matches!(m.kind.as_str(), "撤回" | "系统") {
+            continue;
+        }
+        if revoke_sender_matches(revoke, m, self_wxid, name_to_usr) {
+            return Some(m.clone());
+        }
+    }
     let mut best: Option<&MsgRow> = None;
-    // 只查旧消息：本批新读到的上一条不是被撤回的那条（原消息已被替换掉）。
+    // 同 sort 没命中时只查旧消息：本批里其他 sort 的「上一条」不是被撤回的那条
+    // （聊天框里它已经被撤回，库里剩下的上一条是另一条正常消息）。
     for m in orders {
         // 允许 sort 相同：撤回提示可能就放在原消息的位置上。
         if m.chat != revoke.chat || m.sort > revoke.sort {
@@ -16580,28 +16824,7 @@ fn find_revoke_target(
         if matches!(m.kind.as_str(), "撤回" | "系统") {
             continue;
         }
-        let actor_is_self = |name: &str| {
-            name == "你"
-                || (!self_wxid.is_empty()
-                    && name_to_usr.get(name).is_some_and(|usr| *usr == self_wxid))
-        };
-        let matches = match actor.as_deref() {
-            Some(name) => {
-                if actor_is_self(name) {
-                    !self_wxid.is_empty() && m.sender == self_wxid
-                } else if is_group {
-                    // 备注名 / 群昵称可能对不上：再用「显示名 → username」兜一次。
-                    m.nick == name
-                        || name_to_usr
-                            .get(name)
-                            .is_some_and(|usr| *usr == m.sender)
-                } else {
-                    !self_wxid.is_empty() && m.sender != self_wxid
-                }
-            }
-            None => !is_group && !self_wxid.is_empty() && m.sender != self_wxid,
-        };
-        if !matches {
+        if !revoke_sender_matches(revoke, m, self_wxid, name_to_usr) {
             continue;
         }
         if best.is_none_or(|b| m.sort > b.sort) {

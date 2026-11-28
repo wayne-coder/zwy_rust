@@ -17,10 +17,23 @@ use md5::{Digest, Md5};
 
 use crate::decrypt::{self, KeySpec};
 use crate::model::{ImportResult, MsgRow, QuoteRef};
-use crate::sqlite::Conn;
+use crate::sqlite::{Conn, Row};
 
 /// 导入与实时监控会同时对消息库做解密/查询；串行化避免临时文件互相覆盖。
 static DECRYPT_LOCK: Mutex<()> = Mutex::new(());
+
+/// 微信一般只允许在消息发出后 2 分钟内撤回，这里多留几分钟余量。
+///
+/// 用于两处：① 导入 / 监控单独扫描撤回提示时，时间窗延伸到时段结束之后，
+/// 接住「时段末尾发出的消息在时段结束后才被撤回」；② 监控到结束时间后再多
+/// 跑一个窗口，而不是一到点就停。
+pub const REVOKE_WINDOW_SECS: i64 = 300;
+
+/// 监控时每次额外回看的撤回提示时间窗（秒）。
+///
+/// 微信会把撤回提示回填到原消息的位置，提示的 sort 可能和原消息相同甚至更早，
+/// 增量水位（`sort_seq > last_sort`）取不到它；按时间回看一段才能读到。
+const REVOKE_LOOKBACK_SECS: i64 = 600;
 
 pub enum ImportMsg {
     Status(String),
@@ -160,6 +173,9 @@ fn collect(
     let mut seen: HashSet<(i64, String, String, String)> = HashSet::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut max_sort = since_sort.unwrap_or(req.start_ts.saturating_mul(1000));
+    // 撤回提示的独立扫描窗口（不受增量 sort 水位 / 时段结束限制）。
+    let (notice_from, notice_to) =
+        revoke_notice_window(since_sort, req.start_ts, req.end_ts, Local::now().timestamp());
 
     for (rel, path) in db_files {
         let Some(spec) = req.keys.get(&rel) else {
@@ -214,85 +230,61 @@ fn collect(
                 }
             };
             for r in qrows {
-                let mtype = r.int(0);
-                let sender_id = r.int(1);
-                let sender = name2id.get(&sender_id).cloned().unwrap_or_default();
-                let ts = r.int(2);
-                let content_bytes = r.bytes(3);
-                let compress = r.bytes(4);
-                let (kind, content, link_url, quote, revoke_msgid) =
-                    decode_message(mtype, &content_bytes, &compress);
-                // 撤回提示：用 `newmsgid` 精确查出被撤回原消息的 sort。
-                // 旧库没有 server_id 列时查询失败，保持 None 退回原来的匹配方式。
-                let revoke_target = revoke_msgid.and_then(|msgid| {
-                    // 原消息一定在撤回提示之前，微信撤回窗口只有两分钟；
-                    // 加时间范围既走 create_time 索引，也避免匹配到同 id 的怪数据。
-                    let since = ts.saturating_sub(600);
-                    let sql = format!(
-                        "SELECT sort_seq, create_time FROM \"{table}\" \
-                         WHERE server_id = {msgid} AND create_time BETWEEN {since} AND {ts} LIMIT 1"
-                    );
-                    // 旧库没有 server_id 列 → 查询失败 → None（退回原匹配方式）；
-                    // 查询成功但找不到 → Some(0)（有 id 也不许再猜别的消息）。
-                    match conn.query(&sql) {
-                        Err(_) => None,
-                        Ok(rows) => Some(
-                            rows.first()
-                                .map(|r| {
-                                    let sort_seq = r.int(0);
-                                    if sort_seq > 0 {
-                                        sort_seq
-                                    } else {
-                                        r.int(1).saturating_mul(1000)
-                                    }
-                                })
-                                .filter(|s| *s > 0)
-                                .unwrap_or(0),
-                        ),
-                    }
-                });
+                let row = row_to_msg(&conn, table, &r, chat, &name2id, &req.name_of);
                 // 撤回提示是系统消息（发送人为空），不属于任何分组成员；
                 // 它也不再进引用列表（用户 2026-11-25），按普通消息的成员过滤丢掉。
                 if let Some(f) = filter {
                     // 撤回提示要参与「找到被撤回原消息」，即使它的发送人为空 /
                     // 不在所选成员里也要放进来；它不会进注单列表。
-                    if kind != "撤回" && !f.contains(&sender) {
+                    if row.kind != "撤回" && !f.contains(&row.sender) {
                         continue;
                     }
                 }
-                let sort_seq = r.int(5);
-                let sort = if sort_seq > 0 {
-                    sort_seq
-                } else {
-                    ts.saturating_mul(1000)
-                };
-
-                if !seen.insert((sort, chat.clone(), sender.clone(), content.clone())) {
+                if !seen.insert((
+                    row.sort,
+                    row.chat.clone(),
+                    row.sender.clone(),
+                    row.content.clone(),
+                )) {
                     continue;
                 }
-                max_sort = max_sort.max(sort);
+                max_sort = max_sort.max(row.sort);
+                rows.push(row);
+            }
 
-                let nick = if sender.is_empty() {
-                    "系统".to_string()
-                } else {
-                    req.name_of
-                        .get(&sender)
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| sender.clone())
-                };
-                rows.push(MsgRow {
-                    kind,
-                    nick,
-                    content,
-                    time: format_time(ts),
-                    sort,
-                    chat: chat.clone(),
-                    sender: sender.clone(),
-                    link_url,
-                    quote,
-                    revoke_target,
-                });
+            // 撤回提示单独再扫一遍，不受 `sort_seq` 增量水位约束：微信会把提示
+            // 回填到原消息的位置（sort 相同甚至更早），按增量水位过滤会永远
+            // 读不到，原注单就会一直留在「未撤回」。主查询已经按 `seen` 去重，
+            // 同一行不会重复进入列表。
+            let notice_sql = format!(
+                "SELECT local_type, real_sender_id, create_time, message_content, compress_content, sort_seq, local_id \
+                 FROM \"{table}\" WHERE create_time >= {notice_from} AND create_time <= {notice_to} \
+                 AND ((local_type & 0xFFFF) IN (10000, 10002) \
+                      OR message_content LIKE '%revokemsg%' \
+                      OR compress_content LIKE '%revokemsg%') \
+                 ORDER BY sort_seq, local_id"
+            );
+            match conn.query(&notice_sql) {
+                Ok(notices) => {
+                    for r in notices {
+                        let row = row_to_msg(&conn, table, &r, chat, &name2id, &req.name_of);
+                        // 只有解码后确认是撤回提示的才补进来。
+                        if row.kind != "撤回" {
+                            continue;
+                        }
+                        if !seen.insert((
+                            row.sort,
+                            row.chat.clone(),
+                            row.sender.clone(),
+                            row.content.clone(),
+                        )) {
+                            continue;
+                        }
+                        max_sort = max_sort.max(row.sort);
+                        rows.push(row);
+                    }
+                }
+                Err(e) => warnings.push(format!("{rel} 查询 {table} 撤回提示失败: {e}")),
             }
         }
     }
@@ -303,6 +295,29 @@ fn collect(
         max_sort,
         warnings,
     })
+}
+
+/// 撤回提示的独立扫描时间窗（秒）。
+///
+/// - 全量导入：`[start, end + 撤回窗口]`。时段末尾发出的消息可能在该时段
+///   结束之后才被撤回（提示的 create_time 晚于 end），不能按主消息的
+///   `create_time <= end` 一起过滤，否则重新导入时会把已撤回的原消息带回来。
+/// - 增量监控：从增量水位 / 当前时间中较小者往前回看一段，覆盖 sort 不前进
+///   （回填到原消息位置）的提示，这类提示用 `sort_seq > last_sort` 永远取不到。
+pub(crate) fn revoke_notice_window(
+    since_sort: Option<i64>,
+    start_ts: i64,
+    end_ts: i64,
+    now: i64,
+) -> (i64, i64) {
+    match since_sort {
+        Some(s) => {
+            // sort 一般是毫秒时间戳；`.min(now)` 兜住不可预期的异常水位。
+            let base = (s / 1000).min(now);
+            (base.saturating_sub(REVOKE_LOOKBACK_SECS), now)
+        }
+        None => (start_ts, end_ts.saturating_add(REVOKE_WINDOW_SECS)),
+    }
 }
 
 /// 启动实时监控线程：每 `interval` 检查消息库是否有变化，有则增量读取。
@@ -336,8 +351,12 @@ pub fn start_monitor(
                 std::thread::sleep(Duration::from_millis(200));
             }
 
-            if Local::now().timestamp() > req.end_ts {
-                // 结束前再做一次补拉，避免漏掉最后一个轮询间隔内的消息。
+            if Local::now().timestamp()
+                > req.end_ts.saturating_add(REVOKE_WINDOW_SECS)
+            {
+                // 到点前再做一次补拉，避免漏掉最后一个轮询间隔内的消息。
+                // 结束时间之后仍多跑一个撤回窗口：时段末尾发出的注单可能在
+                // 时段结束之后才被撤回，提示落在 end_ts 之后，主消息查询看不到。
                 final_poll(&req, last_sort, &tx);
                 let _ = tx.send(MonitorMsg::Stopped("已到结束时间".to_string()));
                 ctx.request_repaint();
@@ -455,6 +474,84 @@ fn load_name2id(conn: &Conn) -> HashMap<i64, String> {
         }
     }
     out
+}
+
+/// 把 `Msg_*` 表的一行解析成列表用的消息；撤回提示顺带解析出原消息 sort。
+///
+/// 查询列的顺序固定为：`local_type, real_sender_id, create_time,
+/// message_content, compress_content, sort_seq, local_id`。
+fn row_to_msg(
+    conn: &Conn,
+    table: &str,
+    r: &Row,
+    chat: &str,
+    name2id: &HashMap<i64, String>,
+    name_of: &HashMap<String, String>,
+) -> MsgRow {
+    let mtype = r.int(0);
+    let sender_id = r.int(1);
+    let sender = name2id.get(&sender_id).cloned().unwrap_or_default();
+    let ts = r.int(2);
+    let content_bytes = r.bytes(3);
+    let compress = r.bytes(4);
+    let (kind, content, link_url, quote, revoke_msgid) =
+        decode_message(mtype, &content_bytes, &compress);
+    // 撤回提示：用 `newmsgid` 精确查出被撤回原消息的 sort。
+    // 旧库没有 server_id 列时查询失败，保持 None 退回原来的匹配方式。
+    let revoke_target = revoke_msgid.and_then(|msgid| {
+        // 原消息一定在撤回提示之前，微信撤回窗口只有两分钟；
+        // 加时间范围既走 create_time 索引，也避免匹配到同 id 的怪数据。
+        let since = ts.saturating_sub(600);
+        let sql = format!(
+            "SELECT sort_seq, create_time FROM \"{table}\" \
+             WHERE server_id = {msgid} AND create_time BETWEEN {since} AND {ts} LIMIT 1"
+        );
+        // 旧库没有 server_id 列 → 查询失败 → None（退回原匹配方式）；
+        // 查询成功但找不到 → Some(0)（有 id 也不许再猜别的消息）。
+        match conn.query(&sql) {
+            Err(_) => None,
+            Ok(rows) => Some(
+                rows.first()
+                    .map(|r| {
+                        let sort_seq = r.int(0);
+                        if sort_seq > 0 {
+                            sort_seq
+                        } else {
+                            r.int(1).saturating_mul(1000)
+                        }
+                    })
+                    .filter(|s| *s > 0)
+                    .unwrap_or(0),
+            ),
+        }
+    });
+    let sort_seq = r.int(5);
+    let sort = if sort_seq > 0 {
+        sort_seq
+    } else {
+        ts.saturating_mul(1000)
+    };
+    let nick = if sender.is_empty() {
+        "系统".to_string()
+    } else {
+        name_of
+            .get(&sender)
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| sender.clone())
+    };
+    MsgRow {
+        kind,
+        nick,
+        content,
+        time: format_time(ts),
+        sort,
+        chat: chat.to_string(),
+        sender,
+        link_url,
+        quote,
+        revoke_target,
+    }
 }
 
 fn format_time(ts: i64) -> String {
@@ -743,7 +840,10 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_message, extract_tag, extract_title, parse_quote};
+    use super::{
+        decode_message, extract_tag, extract_title, parse_quote, revoke_notice_window,
+        REVOKE_LOOKBACK_SECS, REVOKE_WINDOW_SECS,
+    };
 
     #[test]
     fn extracts_cdata_title_and_url() {
@@ -828,5 +928,31 @@ mod tests {
         assert_eq!(kind, "撤回");
         assert!(text.contains("撤回了一条消息"), "{text}");
         assert_eq!(msgid, None);
+    }
+
+    /// 全量导入时撤回提示的扫描窗口要覆盖到时段结束之后：时段末尾发出的
+    /// 消息可能到点之后才被撤回，否则重新导入会把已撤回的原消息带回来。
+    #[test]
+    fn revoke_notice_window_covers_after_import_end() {
+        let (from, to) = revoke_notice_window(None, 1_000, 2_000, 9_999);
+        assert_eq!(from, 1_000, "窗口从导入开始时间起");
+        assert_eq!(to, 2_000 + REVOKE_WINDOW_SECS, "窗口延伸到时段结束之后");
+    }
+
+    /// 增量监控时窗口从增量水位往前回看：微信会把撤回提示回填到原消息的
+    /// 位置，提示的 sort 可能不前进，按 `sort_seq > last_sort` 取不到。
+    #[test]
+    fn revoke_notice_window_looks_back_from_incremental_watermark() {
+        let since_ms = 1_700_000_000_000; // 水位 = 1_700_000_000 秒
+        let now = 1_700_000_030;
+        let (from, to) =
+            revoke_notice_window(Some(since_ms), 1_600_000_000, 1_800_000_000, now);
+        assert_eq!(to, now);
+        assert_eq!(from, 1_700_000_000 - REVOKE_LOOKBACK_SECS);
+
+        // 水位是不可预期的异常值时以当前时间兜底，不扫出离谱的窗口。
+        let (from, to) = revoke_notice_window(Some(i64::MAX), 0, 1, now);
+        assert_eq!(to, now);
+        assert_eq!(from, now - REVOKE_LOOKBACK_SECS);
     }
 }
