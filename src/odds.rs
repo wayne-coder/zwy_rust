@@ -176,10 +176,6 @@ impl OddsSet {
         self.values.get_mut(i)
     }
 
-    /// 整份恢复默认值（当前地区）。
-    pub fn reset_to_default(&mut self) {
-        *self = Self::default();
-    }
 }
 
 fn default_regions() -> [OddsSet; 3] {
@@ -190,11 +186,106 @@ fn default_regions() -> [OddsSet; 3] {
     ]
 }
 
-#[derive(Clone, Debug, Default)]
+/// 某个对象在每个字段上是否「显式覆盖」。未覆盖的字段跟随上级
+/// （分组跟默认、会员跟分组），这样文件里只存差异，界面也能显示来源。
+#[derive(Clone, Debug)]
+pub struct OwnedMask {
+    owned: Vec<bool>,
+}
+
+impl Default for OwnedMask {
+    fn default() -> Self {
+        Self {
+            owned: vec![false; FIELDS.len()],
+        }
+    }
+}
+
+impl OwnedMask {
+    pub fn all() -> Self {
+        Self {
+            owned: vec![true; FIELDS.len()],
+        }
+    }
+
+    pub fn is_owned(&self, key: &str) -> bool {
+        field_index(key)
+            .and_then(|i| self.owned.get(i).copied())
+            .unwrap_or(false)
+    }
+
+    pub fn set_owned(&mut self, key: &str, on: bool) {
+        if let Some(i) = field_index(key) {
+            if let Some(slot) = self.owned.get_mut(i) {
+                *slot = on;
+            }
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.owned.iter().any(|b| *b)
+    }
+
+    pub fn clear(&mut self) {
+        for b in &mut self.owned {
+            *b = false;
+        }
+    }
+}
+
+fn default_masks() -> [OwnedMask; 3] {
+    [
+        OwnedMask::default(),
+        OwnedMask::default(),
+        OwnedMask::default(),
+    ]
+}
+
+/// 三个地区全部字段都算显式覆盖（把一份完整配置套给对象时用）。
+pub fn all_masks() -> [OwnedMask; 3] {
+    [
+        OwnedMask::all(),
+        OwnedMask::all(),
+        OwnedMask::all(),
+    ]
+}
+
+/// 把一份「只含覆盖字段」的设置合并到上级设置上。
+fn merge_set(base: &OddsSet, own: &OddsSet, mask: &OwnedMask) -> OddsSet {
+    let mut out = base.clone();
+    for (i, f) in FIELDS.iter().enumerate() {
+        if mask.is_owned(f.key) {
+            if let Some(v) = own.values.get(i).copied() {
+                out.values[i] = v;
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug)]
 pub struct OddsConfig {
     pub default: [OddsSet; 3],
     pub groups: BTreeMap<String, [OddsSet; 3]>,
     pub members: BTreeMap<String, [OddsSet; 3]>,
+    /// 分组 / 会员每个字段是否显式覆盖；未覆盖的字段跟随上级。
+    pub group_owned: BTreeMap<String, [OwnedMask; 3]>,
+    pub member_owned: BTreeMap<String, [OwnedMask; 3]>,
+    /// 命名模板：完整的三地区配置，可一键套给分组 / 会员。
+    pub templates: BTreeMap<String, [OddsSet; 3]>,
+}
+
+impl Default for OddsConfig {
+    fn default() -> Self {
+        Self {
+            default: default_regions(),
+            groups: BTreeMap::new(),
+            members: BTreeMap::new(),
+            group_owned: BTreeMap::new(),
+            member_owned: BTreeMap::new(),
+            templates: BTreeMap::new(),
+        }
+    }
 }
 
 impl OddsConfig {
@@ -202,58 +293,86 @@ impl OddsConfig {
         self.groups.contains_key(name)
     }
 
-    /// 分组第一次被设置时复制默认赔率（和参考项目「新增投注人复制默认」一致）。
+    /// 分组第一次被设置时建立空覆盖（字段仍跟随默认）。
     pub fn ensure_group(&mut self, name: &str) {
         self.groups
             .entry(name.to_string())
             .or_insert_with(default_regions);
+        self.group_owned
+            .entry(name.to_string())
+            .or_insert_with(default_masks);
     }
 
-    /// 新增会员覆盖时复制该会员当前生效的那份（分组或默认）。
-    pub fn ensure_member(&mut self, name: &str, group: Option<&str>) {
-        if self.members.contains_key(name) {
-            return;
+    /// 新增会员覆盖时建立空覆盖（字段仍跟随分组 / 默认）。
+    pub fn ensure_member(&mut self, name: &str, _group: Option<&str>) {
+        self.members
+            .entry(name.to_string())
+            .or_insert_with(default_regions);
+        self.member_owned
+            .entry(name.to_string())
+            .or_insert_with(default_masks);
+    }
+
+    /// 分组在某地区的生效值：默认 + 本组显式覆盖。
+    pub fn group_effective(&self, group: Option<&str>, region: usize) -> OddsSet {
+        let region = region.min(2);
+        let mut base = self.default[region].clone();
+        let Some(group) = group else {
+            return base;
+        };
+        let Some(sets) = self.groups.get(group) else {
+            return base;
+        };
+        match self.group_owned.get(group).and_then(|m| m.get(region)) {
+            Some(mask) => {
+                base = merge_set(&base, &sets[region], mask);
+                base
+            }
+            // 没有 mask 的旧数据：整份覆盖（保持旧行为）。
+            None => sets[region].clone(),
         }
-        let base = [
-            self.resolve(name, group, 0).clone(),
-            self.resolve(name, group, 1).clone(),
-            self.resolve(name, group, 2).clone(),
-        ];
-        self.members.insert(name.to_string(), base);
+    }
+
+    /// 会员在某地区的生效值：分组生效值 + 会员显式覆盖。
+    fn member_effective(
+        &self,
+        key: &str,
+        group: Option<&str>,
+        region: usize,
+    ) -> Option<OddsSet> {
+        let sets = self.members.get(key)?;
+        let base = self.group_effective(group, region);
+        match self.member_owned.get(key).and_then(|m| m.get(region)) {
+            Some(mask) => Some(merge_set(&base, &sets[region], mask)),
+            None => Some(sets[region].clone()),
+        }
     }
 
     /// 结算时取赔率：会员覆盖 → 分组 → 默认。
-    pub fn resolve(&self, member: &str, group: Option<&str>, region: usize) -> &OddsSet {
-        let region = region.min(2);
-        if let Some(p) = self.members.get(member) {
-            return &p[region];
-        }
-        if let Some(g) = group {
-            if let Some(p) = self.groups.get(g) {
-                return &p[region];
-            }
-        }
-        &self.default[region]
+    /// 返回的是按字段合并后的生效值。
+    pub fn resolve(&self, member: &str, group: Option<&str>, region: usize) -> OddsSet {
+        self.member_effective(member, group, region)
+            .unwrap_or_else(|| self.group_effective(group, region))
     }
 
     /// 结算时取赔率：先按「会员来源身份」（`m:<会话>:<发送人>`）找覆盖，
     /// 再退回旧的「昵称」覆盖，最后分组 / 默认。
-    ///
-    /// 同名但来自不同群聊 / 会话的会员因此可以各存一份覆盖；
-    /// 旧版按昵称保存的赔率仍然生效。
     pub fn resolve_member(
         &self,
         identity: &str,
         nick: &str,
         group: Option<&str>,
         region: usize,
-    ) -> &OddsSet {
-        let region = region.min(2);
-        if let Some(p) = self.members.get(identity) {
-            return &p[region];
+    ) -> OddsSet {
+        if let Some(set) = self.member_effective(identity, group, region) {
+            return set;
         }
-        self.resolve(nick, group, region)
+        if let Some(set) = self.member_effective(nick, group, region) {
+            return set;
+        }
+        self.group_effective(group, region)
     }
+
 }
 
 /// 地区下标：0 澳门、1 香港、2 老澳门。
@@ -297,13 +416,23 @@ pub fn save(config: &OddsConfig) {
     let _ = fs::rename(&tmp, &path);
 }
 
-fn write_set(out: &mut String, kind: &str, name: &str, region: usize, set: &OddsSet) {
+fn write_set(
+    out: &mut String,
+    kind: &str,
+    name: &str,
+    region: usize,
+    set: &OddsSet,
+    mask: Option<&OwnedMask>,
+) {
     out.push_str(kind);
     out.push('\t');
     out.push_str(name);
     out.push('\t');
     out.push_str(&region.to_string());
     for (i, f) in FIELDS.iter().enumerate() {
+        if mask.is_some_and(|m| !m.is_owned(f.key)) {
+            continue;
+        }
         out.push('\t');
         out.push_str(f.key);
         out.push('=');
@@ -317,15 +446,20 @@ pub fn serialize(config: &OddsConfig) -> String {
     let mut out = String::from(MAGIC);
     out.push('\n');
     for (region, set) in config.default.iter().enumerate() {
-        write_set(&mut out, "default", "默认", region, set);
+        write_set(&mut out, "default", "默认", region, set, None);
     }
     for (name, sets) in &config.groups {
         let name = clean_name(name);
         if name.is_empty() {
             continue;
         }
+        let masks = config.group_owned.get(name.as_str());
         for (region, set) in sets.iter().enumerate() {
-            write_set(&mut out, "group", &name, region, set);
+            let mask = masks.map(|m| &m[region]);
+            if mask.is_some_and(|m| !m.any()) {
+                continue;
+            }
+            write_set(&mut out, "group", &name, region, set, mask);
         }
     }
     for (name, sets) in &config.members {
@@ -333,8 +467,22 @@ pub fn serialize(config: &OddsConfig) -> String {
         if name.is_empty() {
             continue;
         }
+        let masks = config.member_owned.get(name.as_str());
         for (region, set) in sets.iter().enumerate() {
-            write_set(&mut out, "member", &name, region, set);
+            let mask = masks.map(|m| &m[region]);
+            if mask.is_some_and(|m| !m.any()) {
+                continue;
+            }
+            write_set(&mut out, "member", &name, region, set, mask);
+        }
+    }
+    for (name, sets) in &config.templates {
+        let name = clean_name(name);
+        if name.is_empty() {
+            continue;
+        }
+        for (region, set) in sets.iter().enumerate() {
+            write_set(&mut out, "template", &name, region, set, None);
         }
     }
     out
@@ -355,21 +503,42 @@ pub fn parse(text: &str) -> OddsConfig {
         if region > 2 {
             continue;
         }
-        let target: &mut [OddsSet; 3] = match kind {
-            "default" => &mut config.default,
+        let (target, mut mask): (&mut [OddsSet; 3], Option<&mut OwnedMask>) = match kind {
+            "default" => (&mut config.default, None),
             "group" => {
                 let name = clean_name(name);
                 if name.is_empty() {
                     continue;
                 }
-                config.groups.entry(name).or_insert_with(default_regions)
+                let sets = config.groups.entry(name.clone()).or_insert_with(default_regions);
+                let masks = config
+                    .group_owned
+                    .entry(name)
+                    .or_insert_with(default_masks);
+                (sets, Some(&mut masks[region]))
             }
             "member" => {
                 let name = clean_name(name);
                 if name.is_empty() {
                     continue;
                 }
-                config.members.entry(name).or_insert_with(default_regions)
+                let sets = config.members.entry(name.clone()).or_insert_with(default_regions);
+                let masks = config
+                    .member_owned
+                    .entry(name)
+                    .or_insert_with(default_masks);
+                (sets, Some(&mut masks[region]))
+            }
+            "template" => {
+                let name = clean_name(name);
+                if name.is_empty() {
+                    continue;
+                }
+                let sets = config
+                    .templates
+                    .entry(name)
+                    .or_insert_with(default_regions);
+                (sets, None)
             }
             _ => continue,
         };
@@ -381,8 +550,12 @@ pub fn parse(text: &str) -> OddsConfig {
             let Ok(v) = value.trim().parse::<f64>() else {
                 continue;
             };
-            if let Some(slot) = set.value_mut(key.trim()) {
+            let key = key.trim();
+            if let Some(slot) = set.value_mut(key) {
                 *slot = round2(v).max(0.0);
+                if let Some(mask) = mask.as_mut() {
+                    mask.set_owned(key, true);
+                }
             }
         }
     }
@@ -402,12 +575,16 @@ mod tests {
                 .value_mut("two_in_two")
             {
                 *v = 70.0;
+                cfg.group_owned.get_mut("A 组").unwrap()[region]
+                    .set_owned("two_in_two", true);
             }
         }
         cfg.ensure_member("张三", Some("A 组"));
         cfg.members.get_mut("张三").unwrap()[1]
             .value_mut("rw_two_in_two")
             .map(|v| *v = 12.5);
+        cfg.member_owned.get_mut("张三").unwrap()[1]
+            .set_owned("rw_two_in_two", true);
 
         let text = serialize(&cfg);
         let back = parse(&text);
@@ -428,6 +605,8 @@ mod tests {
                 .value_mut("two_in_two")
             {
                 *v = 70.0;
+                cfg.member_owned.get_mut("张三").unwrap()[region]
+                    .set_owned("two_in_two", true);
             }
         }
         // 旧版昵称覆盖仍然生效。
@@ -443,6 +622,8 @@ mod tests {
                 .value_mut("two_in_two")
             {
                 *v = 80.0;
+                cfg.member_owned.get_mut("m:群2:wxid_a").unwrap()[region]
+                    .set_owned("two_in_two", true);
             }
         }
         assert_eq!(
@@ -471,6 +652,67 @@ mod tests {
         assert_eq!(d.value("three_in_two_sa"), 100.0);
         assert_eq!(d.value("lianxiao_ma_2"), 4.0);
         assert_eq!(d.value("rw_three_in_two"), 15.0);
+    }
+
+    #[test]
+    fn sparse_overrides_merge_and_serialize() {
+        let mut cfg = OddsConfig::default();
+        cfg.ensure_group("A");
+        cfg.groups.get_mut("A").unwrap()[0]
+            .value_mut("two_in_two")
+            .map(|v| *v = 70.0);
+        cfg.group_owned.get_mut("A").unwrap()[0].set_owned("two_in_two", true);
+
+        cfg.ensure_member("m:g:u", Some("A"));
+        cfg.members.get_mut("m:g:u").unwrap()[0]
+            .value_mut("three_in_three")
+            .map(|v| *v = 800.0);
+        cfg.member_owned.get_mut("m:g:u").unwrap()[0]
+            .set_owned("three_in_three", true);
+
+        // 会员只覆盖三中三，二中二继续跟随分组。
+        let set = cfg.resolve_member("m:g:u", "", Some("A"), 0);
+        assert_eq!(set.value("two_in_two"), 70.0);
+        assert_eq!(set.value("three_in_three"), 800.0);
+        // 同组其它会员只继承分组覆盖。
+        assert_eq!(cfg.resolve("", Some("A"), 0).value("three_in_three"), 750.0);
+
+        let text = serialize(&cfg);
+        let group_line = text
+            .lines()
+            .find(|l| l.starts_with("group\tA\t0"))
+            .unwrap();
+        assert!(group_line.contains("two_in_two="));
+        assert!(!group_line.contains("flat_number="));
+        let member_line = text
+            .lines()
+            .find(|l| l.starts_with("member\tm:g:u\t0"))
+            .unwrap();
+        assert!(member_line.contains("three_in_three="));
+        assert!(!member_line.contains("two_in_two="));
+
+        let back = parse(&text);
+        let set = back.resolve_member("m:g:u", "", Some("A"), 0);
+        assert_eq!(set.value("two_in_two"), 70.0);
+        assert_eq!(set.value("three_in_three"), 800.0);
+    }
+
+    #[test]
+    fn templates_roundtrip() {
+        let mut cfg = OddsConfig::default();
+        let mut t = [
+            OddsSet::default(),
+            OddsSet::default(),
+            OddsSet::default(),
+        ];
+        t[0].value_mut("two_in_two").map(|v| *v = 80.0);
+        cfg.templates.insert("高赔".to_string(), t);
+
+        let back = parse(&serialize(&cfg));
+        assert_eq!(
+            back.templates.get("高赔").unwrap()[0].value("two_in_two"),
+            80.0
+        );
     }
 
     #[test]

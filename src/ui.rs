@@ -607,6 +607,20 @@ pub struct ViewerApp {
     odds_scope: OddsScope,
     odds_region: usize,
     odds_new_member: String,
+    /// 赔率设置：左侧玩法分组导航 / 搜索 / 只看已修改 / 三地区同步
+    odds_group_tab: usize,
+    odds_search: String,
+    odds_only_modified: bool,
+    odds_sync_regions: bool,
+    /// 模板名输入、当前选中的模板
+    odds_template_name: String,
+    odds_template_pick: Option<String>,
+    /// 「复制当前赔率配置到其他会员」弹窗是否打开
+    odds_copy_open: bool,
+    /// 复制弹窗里勾选的会员（身份键 `m:会话:发送人`）
+    odds_copy_targets: HashSet<String>,
+    /// 复制弹窗选择的来源模板（None = 当前编辑对象）
+    odds_copy_template: Option<String>,
 
     // 风险页面（复刻参考项目右列面板）
     risk_tab: RiskTab,
@@ -908,6 +922,15 @@ impl ViewerApp {
             odds_scope: OddsScope::Default,
             odds_region: 0,
             odds_new_member: String::new(),
+            odds_group_tab: 0,
+            odds_search: String::new(),
+            odds_only_modified: false,
+            odds_sync_regions: true,
+            odds_template_name: String::new(),
+            odds_template_pick: None,
+            odds_copy_open: false,
+            odds_copy_targets: HashSet::new(),
+            odds_copy_template: None,
             risk_tab: RiskTab::XiaoMa,
             risk_xm_region: None,
             risk_xm_sort: RiskSort::Risk,
@@ -1689,6 +1712,11 @@ impl ViewerApp {
     /// 从当前注单列表删除一条（只影响本程序，不改微信数据；重新导入会恢复）。
     fn delete_order(&mut self, row: &MsgRow) {
         let key = edit_key(row);
+        // 删除前先记下它在当前可见列表里的位置：删完选中上一条。
+        let old_pos = self
+            .visible_order_indices()
+            .iter()
+            .position(|&i| edit_key(&self.orders[i]) == key);
         self.orders.retain(|r| edit_key(r) != key);
         self.order_keys.retain(|k| {
             !(k.0 == row.sort
@@ -1709,6 +1737,14 @@ impl ViewerApp {
             self.scroll_to_order = false;
             self.edit_text.clear();
             self.edit_time.clear();
+            // 选中被删掉那条的上一条；删的是第一条时选新的第一条。
+            if let Some(pos) = old_pos {
+                let visible = self.visible_order_indices();
+                if !visible.is_empty() {
+                    let target = pos.saturating_sub(1).min(visible.len() - 1);
+                    self.select_order_entry(visible[target]);
+                }
+            }
         }
     }
 
@@ -3940,7 +3976,7 @@ impl ViewerApp {
     }
 
     /// 某条注单在指定地区的赔率：会员覆盖（来源身份 → 旧昵称）→ 分组 → 默认。
-    fn odds_for_row(&self, row: &MsgRow, lottery: &str) -> &crate::odds::OddsSet {
+    fn odds_for_row(&self, row: &MsgRow, lottery: &str) -> crate::odds::OddsSet {
         let group = self.group_with_odds_for(&row.chat, &row.sender);
         let identity = member_identity(&row.chat, &row.sender);
         self.odds.resolve_member(
@@ -3952,7 +3988,7 @@ impl ViewerApp {
     }
 
     /// 详情面板正在展示的会员（注单详情优先，其次单条录入选中的会员）。
-    fn detail_odds(&self, lottery: &str) -> &crate::odds::OddsSet {
+    fn detail_odds(&self, lottery: &str) -> crate::odds::OddsSet {
         if let Some(row) = &self.selected_order_row {
             let group = self.group_with_odds_for(&row.chat, &row.sender);
             let identity = member_identity(&row.chat, &row.sender);
@@ -4037,11 +4073,12 @@ impl ViewerApp {
             let mut ws: BTreeMap<String, f64> = BTreeMap::new();
             let mut wa: BTreeMap<String, f64> = BTreeMap::new();
             for bet in &conv.bets {
+                let odds = self.odds_for_row(row, &bet.lottery);
                 let ev = settle::evaluate(
                     bet,
                     self.draws.get(&bet.lottery),
                     &mul_sep,
-                    self.odds_for_row(row, &bet.lottery),
+                    &odds,
                 );
                 let cat = bill_category(&bet.play);
                 let slice = br.cats.entry(cat).or_default();
@@ -4855,6 +4892,132 @@ impl ViewerApp {
             MemberKey::Contact(c) => g.upline_contacts.contains(c),
             MemberKey::Member(c, m) => g.upline_members.iter().any(|(gc, gm)| gc == c && gm == m),
         })
+    }
+
+    /// 成员栏悬停提示：显示所属微信群 / 微信 ID / 会员分组，便于区分同名成员。
+    fn member_rail_tooltip(&self, data: &AppData, key: &MemberKey) -> String {
+        match key {
+            MemberKey::Contact(c) => {
+                let name = display_of_contact(data, c);
+                let mut text = format!("联系人：{name}");
+                if name != *c {
+                    text.push_str(&format!("\n微信 ID：{c}"));
+                }
+                let groups: Vec<&str> = self
+                    .groups
+                    .iter()
+                    .filter(|g| g.contacts.contains(c))
+                    .map(|g| g.name.as_str())
+                    .collect();
+                if !groups.is_empty() {
+                    text.push_str(&format!("\n会员分组：{}", groups.join("、")));
+                }
+                text
+            }
+            MemberKey::Member(chat, member) => {
+                let group = data.groups.iter().find(|g| g.username == *chat);
+                let group_name = group
+                    .map(|g| g.name.clone())
+                    .unwrap_or_else(|| chat.clone());
+                let member_name = group
+                    .and_then(|g| g.members.iter().find(|p| p.username == *member))
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| member.clone());
+                let mut text = format!("群聊：{group_name}\n成员：{member_name}");
+                if member_name != *member {
+                    text.push_str(&format!("\n微信 ID：{member}"));
+                }
+                let groups: Vec<&str> = self
+                    .groups
+                    .iter()
+                    .filter(|g| g.members.contains(&(chat.clone(), member.clone())))
+                    .map(|g| g.name.as_str())
+                    .collect();
+                if !groups.is_empty() {
+                    text.push_str(&format!("\n会员分组：{}", groups.join("、")));
+                }
+                text
+            }
+        }
+    }
+
+    /// 成员栏右键：设置 / 取消上家。当前选了具体分组时只改该组，
+    /// 「全部分组」时改所有包含这个成员的分组。
+    fn set_member_upline(&mut self, key: &MemberKey, on: bool) {
+        let filter = self.order_filter.clone();
+        let mut changed = false;
+        for g in &mut self.groups {
+            if filter.as_deref().is_some_and(|name| g.name != name) {
+                continue;
+            }
+            match key {
+                MemberKey::Contact(c) => {
+                    if g.contacts.contains(c) {
+                        changed |= if on {
+                            g.upline_contacts.insert(c.clone())
+                        } else {
+                            g.upline_contacts.remove(c)
+                        };
+                    }
+                }
+                MemberKey::Member(chat, member) => {
+                    let k = (chat.clone(), member.clone());
+                    if g.members.contains(&k) {
+                        changed |= if on {
+                            g.upline_members.insert(k)
+                        } else {
+                            g.upline_members.remove(&k)
+                        };
+                    }
+                }
+            }
+        }
+        if changed {
+            groups::save(&self.groups);
+            self.selection_dirty = true;
+        }
+    }
+
+    /// 成员栏右键：从分组里移除成员（不影响微信数据）。当前选了具体分组
+    /// 时只移出该组，「全部分组」时移出所有包含它的分组。
+    fn remove_member_from_groups(&mut self, key: &MemberKey) {
+        let filter = self.order_filter.clone();
+        for g in &mut self.groups {
+            if filter.as_deref().is_some_and(|name| g.name != name) {
+                continue;
+            }
+            match key {
+                MemberKey::Contact(c) => {
+                    g.contacts.remove(c);
+                    g.upline_contacts.remove(c);
+                }
+                MemberKey::Member(chat, member) => {
+                    let k = (chat.clone(), member.clone());
+                    g.members.remove(&k);
+                    g.upline_members.remove(&k);
+                }
+            }
+        }
+        match key {
+            MemberKey::Contact(c) => {
+                self.selected_contacts.remove(c);
+            }
+            MemberKey::Member(chat, member) => {
+                self.selected_members.remove(&(chat.clone(), member.clone()));
+                self.expanded.insert(chat.clone());
+            }
+        }
+        groups::save(&self.groups);
+        self.selection_dirty = true;
+        if self.member_focus.as_ref() == Some(key) {
+            self.member_focus = None;
+            self.selected_order_row = None;
+            self.selected_order_key = None;
+            self.converted = None;
+            self.edit_text.clear();
+            self.edit_time.clear();
+            self.ocr_msg = None;
+        }
     }
 
     /// 当前注单转换出的全部注（忽略投注人），供风险面板汇总。
@@ -6551,7 +6714,44 @@ impl ViewerApp {
                             }
                             let label = truncate_display(&name_of(key), 4);
                             let selected = self.member_focus.as_ref() == Some(key);
-                            if rail_item(ui, &label, selected) {
+                            let resp = rail_item(ui, &label, selected);
+                            // 悬停显示所在微信群 / 微信 ID / 会员分组，便于区分同名成员。
+                            resp.clone()
+                                .on_hover_text(self.member_rail_tooltip(data, key));
+                            let is_up = self.is_upline_key(key);
+                            resp.context_menu(|ui| {
+                                compact_context_menu(ui);
+                                let up_label =
+                                    if is_up { "取消上家" } else { "设为上家" };
+                                if ui
+                                    .add(egui::Button::new(
+                                        RichText::new(up_label).size(12.0),
+                                    ))
+                                    .on_hover_text(
+                                        "上家发的注单在风险页按减额（负数）统计",
+                                    )
+                                    .clicked()
+                                {
+                                    self.set_member_upline(key, !is_up);
+                                    ui.close();
+                                }
+                                if ui
+                                    .add(egui::Button::new(
+                                        RichText::new("移除成员")
+                                            .size(12.0)
+                                            .color(RED),
+                                    ))
+                                    .on_hover_text(
+                                        "从会员分组中移除，不影响微信数据；\
+                                         当前选了分组时只移出该组",
+                                    )
+                                    .clicked()
+                                {
+                                    self.remove_member_from_groups(key);
+                                    ui.close();
+                                }
+                            });
+                            if resp.clicked() {
                                 // 点成员只筛左侧注单；右侧面板不再显示整段成员消息。
                                 // 再点一次同一个成员 = 取消筛选。
                                 self.member_focus = if selected {
@@ -7053,11 +7253,12 @@ impl ViewerApp {
                                         out.bets
                                             .iter()
                                             .map(|b| {
+                                                let odds = self.detail_odds(&b.lottery);
                                                 settle::evaluate(
                                                     b,
                                                     self.draws.get(&b.lottery),
                                                     &mul_sep,
-                                                    self.detail_odds(&b.lottery),
+                                                    &odds,
                                                 )
                                                 .win_amount
                                             })
@@ -7620,6 +7821,36 @@ impl ViewerApp {
             .collect()
     }
 
+    /// 选中完整注单列表里的第 `index` 条，并同步详情面板。
+    /// 不切换页面 / 筛选：供列表内导航和删除后的回选使用。
+    fn select_order_entry(&mut self, index: usize) {
+        let Some(row) = self.orders.get(index).cloned() else {
+            return;
+        };
+        let key = (
+            row.sort,
+            row.chat.clone(),
+            row.nick.clone(),
+            row.content.clone(),
+        );
+        let conv = self
+            .auto_converted
+            .get(&edit_key(&row))
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut conv = safe_convert(&row.content, &self.keywords, &self.replacements);
+                self.apply_doubt_override(&edit_key(&row), &mut conv);
+                conv
+            });
+        self.selected_order_key = Some(key);
+        self.edit_time = row.time.clone();
+        self.selected_order_row = Some(row.clone());
+        self.scroll_to_order = true;
+        self.converted = Some(conv);
+        self.edit_text = row.content;
+        self.ocr_msg = None;
+    }
+
     /// 在过滤后的注单列表里向上（-1）或向下（1）选中一条。
     fn select_adjacent_order(&mut self, visible: &[usize], dir: isize) {
         if visible.is_empty() {
@@ -7637,24 +7868,7 @@ impl ViewerApp {
             (None, true) => visible.len() - 1,
             (None, false) => 0,
         };
-        let row = self.orders[visible[pos]].clone();
-        let key = (row.sort, row.chat.clone(), row.nick.clone(), row.content.clone());
-        let conv = self
-            .auto_converted
-            .get(&edit_key(&row))
-            .cloned()
-            .unwrap_or_else(|| {
-                let mut conv = safe_convert(&row.content, &self.keywords, &self.replacements);
-                self.apply_doubt_override(&edit_key(&row), &mut conv);
-                conv
-            });
-        self.selected_order_key = Some(key);
-        self.edit_time = row.time.clone();
-        self.selected_order_row = Some(row.clone());
-        self.scroll_to_order = true;
-        self.converted = Some(conv);
-        self.edit_text = row.content;
-        self.ocr_msg = None;
+        self.select_order_entry(visible[pos]);
     }
 
     // ---------------- 选定会员页 ----------------
@@ -8776,20 +8990,44 @@ impl ViewerApp {
         }
     }
 
-    /// 当前编辑对象（默认 / 分组 / 会员）的三地区赔率。
-    fn odds_scope_sets_mut(&mut self) -> &mut [crate::odds::OddsSet; 3] {
-        match self.odds_scope.clone() {
-            OddsScope::Default => &mut self.odds_draft.default,
-            OddsScope::Group(name) => {
-                self.odds_draft.ensure_group(&name);
-                self.odds_draft.groups.get_mut(&name).expect("group ensured")
-            }
-            OddsScope::Member(name) => {
-                self.odds_draft.ensure_member(&name, None);
-                self.odds_draft
-                    .members
-                    .get_mut(&name)
-                    .expect("member ensured")
+    /// 会员身份键（`m:会话:发送人`）所属的会员分组名。
+    fn odds_group_for_identity(&self, key: &str) -> Option<String> {
+        let (chat, sender) = identity_parts(key)?;
+        self.groups
+            .iter()
+            .find(|g| {
+                if chat.ends_with("@chatroom") {
+                    g.members
+                        .contains(&(chat.to_string(), sender.to_string()))
+                } else {
+                    g.contacts.contains(chat)
+                }
+            })
+            .map(|g| g.name.clone())
+    }
+
+    /// 当前编辑对象的三地区生效值（覆盖 + 继承后的结果）。
+    fn odds_effective_for_scope(
+        &self,
+        scope: &OddsScope,
+    ) -> [crate::odds::OddsSet; 3] {
+        match scope {
+            OddsScope::Default => self.odds_draft.default.clone(),
+            OddsScope::Group(name) => [
+                self.odds_draft.group_effective(Some(name), 0),
+                self.odds_draft.group_effective(Some(name), 1),
+                self.odds_draft.group_effective(Some(name), 2),
+            ],
+            OddsScope::Member(key) => {
+                let group = self.odds_group_for_identity(key);
+                [
+                    self.odds_draft
+                        .resolve_member(key, key, group.as_deref(), 0),
+                    self.odds_draft
+                        .resolve_member(key, key, group.as_deref(), 1),
+                    self.odds_draft
+                        .resolve_member(key, key, group.as_deref(), 2),
+                ]
             }
         }
     }
@@ -8797,12 +9035,13 @@ impl ViewerApp {
     /// 赔率与回水：默认一套、每个分组一套、会员可单独覆盖。
     fn odds_dialog(&mut self, ctx: &egui::Context) {
         if !self.odds_open {
+            self.odds_copy_open = false;
             return;
         }
         let group_names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
         // 会员覆盖的显示名：新键按「来源身份」显示成「昵称（群名 / 联系人）」，
         // 旧版按昵称保存的键原样显示。先算好，窗口闭包里不再借 self.state。
-        let (member_names, member_labels, candidates) = {
+        let (member_names, member_labels, candidates, copy_targets) = {
             let data = match &self.state {
                 State::Ready(d) => Some(&**d),
                 _ => None,
@@ -8835,7 +9074,42 @@ impl ViewerApp {
                 candidates.push((key, label, group));
             }
             candidates.sort_by(|a, b| a.1.cmp(&b.1));
-            (names, labels, candidates)
+
+            // 复制目标：已有会员覆盖 + 注单里的会员 + 会员分组里的联系人和群成员。
+            // 用身份键 `m:会话:发送人`，同名不同群 / 会话各算一个人。
+            let mut targets: HashMap<String, String> = HashMap::new();
+            for key in &names {
+                targets.insert(
+                    key.clone(),
+                    labels.get(key).cloned().unwrap_or_else(|| key.clone()),
+                );
+            }
+            for (key, label, _) in &candidates {
+                targets.entry(key.clone()).or_insert_with(|| label.clone());
+            }
+            if let Some(d) = data {
+                for g in &self.groups {
+                    for c in &g.contacts {
+                        let key = member_identity(c, c);
+                        targets
+                            .entry(key.clone())
+                            .or_insert_with(|| member_key_label(&key, Some(d)));
+                    }
+                    for (chat, member) in &g.members {
+                        let key = member_identity(chat, member);
+                        targets
+                            .entry(key.clone())
+                            .or_insert_with(|| member_key_label(&key, Some(d)));
+                    }
+                }
+            }
+            // 来源本人不列为复制目标。
+            if let OddsScope::Member(src) = &self.odds_scope {
+                targets.remove(src);
+            }
+            let mut copy_targets: Vec<(String, String)> = targets.into_iter().collect();
+            copy_targets.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            (names, labels, candidates, copy_targets)
         };
 
         let mut open = true;
@@ -8845,6 +9119,72 @@ impl ViewerApp {
         let mut delete_member = false;
         let mut reset_region = false;
         let mut copy_macau = false;
+        // 当前编辑对象的显示名，复制弹窗里也要用。
+        let scope_text = match &self.odds_scope {
+            OddsScope::Default => "默认（未匹配分组 / 会员）".to_string(),
+            OddsScope::Group(name) => format!("分组：{name}"),
+            OddsScope::Member(key) => format!(
+                "会员：{}",
+                member_labels.get(key).cloned().unwrap_or_else(|| key.clone())
+            ),
+        };
+
+        // 编辑视图的局部副本：渲染时同时能读到「上级生效值」，结束后写回草稿。
+        let scope = self.odds_scope.clone();
+        let member_group = match &scope {
+            OddsScope::Member(key) => self.odds_group_for_identity(key),
+            _ => None,
+        };
+        let (mut scope_sets, mut scope_masks) = match &scope {
+            OddsScope::Default => (self.odds_draft.default.clone(), None),
+            OddsScope::Group(name) => {
+                self.odds_draft.ensure_group(name);
+                (
+                    self.odds_draft.groups.get(name).cloned().unwrap(),
+                    Some(
+                        self.odds_draft
+                            .group_owned
+                            .get(name)
+                            .cloned()
+                            .unwrap(),
+                    ),
+                )
+            }
+            OddsScope::Member(key) => {
+                self.odds_draft.ensure_member(key, member_group.as_deref());
+                (
+                    self.odds_draft.members.get(key).cloned().unwrap(),
+                    Some(
+                        self.odds_draft
+                            .member_owned
+                            .get(key)
+                            .cloned()
+                            .unwrap(),
+                    ),
+                )
+            }
+        };
+        // 未覆盖字段跟随的上级值：分组跟默认，会员跟分组。
+        let inherited_sets: [crate::odds::OddsSet; 3] = match &scope {
+            OddsScope::Member(_) => [
+                self.odds_draft
+                    .group_effective(member_group.as_deref(), 0),
+                self.odds_draft
+                    .group_effective(member_group.as_deref(), 1),
+                self.odds_draft
+                    .group_effective(member_group.as_deref(), 2),
+            ],
+            _ => self.odds_draft.default.clone(),
+        };
+        let modified_count = scope_masks
+            .as_ref()
+            .map(|m| {
+                crate::odds::FIELDS
+                    .iter()
+                    .filter(|f| (0..3).any(|r| m[r].is_owned(f.key)))
+                    .count()
+            })
+            .unwrap_or(0);
 
         egui::Window::new("赔率与回水")
             .collapsible(false)
@@ -8865,17 +9205,9 @@ impl ViewerApp {
 
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("编辑对象").size(12.0).color(TEXT));
-                    let scope_text = match &self.odds_scope {
-                        OddsScope::Default => "默认（未匹配分组 / 会员）".to_string(),
-                        OddsScope::Group(name) => format!("分组：{name}"),
-                        OddsScope::Member(key) => format!(
-                            "会员：{}",
-                            member_labels.get(key).cloned().unwrap_or_else(|| key.clone())
-                        ),
-                    };
                     egui::ComboBox::from_id_salt("odds_scope")
                         .width(240.0)
-                        .selected_text(RichText::new(scope_text).size(12.0))
+                        .selected_text(RichText::new(scope_text.clone()).size(12.0))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.odds_scope,
@@ -8948,6 +9280,89 @@ impl ViewerApp {
                 });
 
                 ui.add_space(4.0);
+                // 模板：保存当前生效配置 / 一键套用。
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("模板").size(11.0).color(SUB));
+                    let mut resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.odds_template_name)
+                            .hint_text("模板名，如：标准 / 高赔")
+                            .desired_width(140.0),
+                    );
+                    text_edit_context_menu(
+                        ui.ctx(),
+                        resp.id,
+                        &mut self.odds_template_name,
+                        &mut resp,
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.odds_template_name.trim().is_empty(),
+                            tiny_button("保存为模板", TEXT),
+                        )
+                        .on_hover_text("把当前对象的三地区生效值保存为模板")
+                        .clicked()
+                    {
+                        let name = self.odds_template_name.trim().to_string();
+                        if !name.is_empty() {
+                            let mut effective = inherited_sets.clone();
+                            if let Some(m) = &scope_masks {
+                                for (r, set) in effective.iter_mut().enumerate() {
+                                    for f in crate::odds::FIELDS {
+                                        if m[r].is_owned(f.key) {
+                                            if let Some(v) = set.value_mut(f.key) {
+                                                *v = scope_sets[r].value(f.key);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                effective = scope_sets.clone();
+                            }
+                            self.odds_draft.templates.insert(name.clone(), effective);
+                            self.odds_template_pick = Some(name);
+                            self.odds_template_name.clear();
+                        }
+                    }
+                    let template_names: Vec<String> =
+                        self.odds_draft.templates.keys().cloned().collect();
+                    if !template_names.is_empty() {
+                        let selected = self
+                            .odds_template_pick
+                            .clone()
+                            .unwrap_or_else(|| "载入模板…".to_string());
+                        egui::ComboBox::from_id_salt("odds_template_pick")
+                            .width(150.0)
+                            .selected_text(RichText::new(selected).size(11.5))
+                            .show_ui(ui, |ui| {
+                                for name in &template_names {
+                                    let picked = self
+                                        .odds_template_pick
+                                        .as_deref()
+                                        == Some(name.as_str());
+                                    if ui.selectable_label(picked, name).clicked() {
+                                        if let Some(t) =
+                                            self.odds_draft.templates.get(name).cloned()
+                                        {
+                                            scope_sets = t;
+                                            if let Some(m) = &mut scope_masks {
+                                                *m = crate::odds::all_masks();
+                                            }
+                                            self.odds_template_pick = Some(name.clone());
+                                        }
+                                    }
+                                }
+                            });
+                        if self.odds_template_pick.is_some()
+                            && ui.add(tiny_button("删除模板", RED)).clicked()
+                        {
+                            if let Some(name) = self.odds_template_pick.take() {
+                                self.odds_draft.templates.remove(&name);
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     for (i, label) in crate::odds::REGION_LABELS.iter().enumerate() {
                         if ui
@@ -8961,9 +9376,24 @@ impl ViewerApp {
                         }
                     }
                     ui.separator();
+                    ui.checkbox(&mut self.odds_sync_regions, "三地区同步")
+                        .on_hover_text(
+                            "改一个地区的数值时，同时写入澳门 / 香港 / 老澳门",
+                        );
+                    ui.checkbox(&mut self.odds_only_modified, "只看已修改");
+                    ui.separator();
+                    if matches!(&scope, OddsScope::Default) {
+                        ui.label(RichText::new("基础配置").size(10.5).color(SUB));
+                    } else {
+                        ui.label(
+                            RichText::new(format!("已修改 {modified_count} 项"))
+                                .size(10.5)
+                                .color(if modified_count > 0 { ORANGE } else { SUB }),
+                        );
+                    }
                     if ui
-                        .add(tiny_button("本地区恢复默认", SUB))
-                        .on_hover_text("只把当前对象、当前地区的赔率 / 回水恢复为默认值")
+                        .add(tiny_button("全部恢复继承", SUB))
+                        .on_hover_text("清除当前对象的全部覆盖，重新跟随分组 / 默认")
                         .clicked()
                     {
                         reset_region = true;
@@ -8975,7 +9405,18 @@ impl ViewerApp {
                     {
                         copy_macau = true;
                     }
-                    if matches!(self.odds_scope, OddsScope::Member(_))
+                    if ui
+                        .add(tiny_button("复制到其他会员…", SUB))
+                        .on_hover_text(
+                            "把当前对象（默认 / 分组 / 会员）的三地区赔率与回水复制给勾选的会员",
+                        )
+                        .clicked()
+                    {
+                        self.odds_copy_open = true;
+                        self.odds_copy_targets.clear();
+                        self.odds_copy_template = None;
+                    }
+                    if matches!(&scope, OddsScope::Member(_))
                         && ui
                             .add(tiny_button("删除该会员覆盖", RED))
                             .on_hover_text("删除后该会员重新使用分组 / 默认赔率")
@@ -8984,7 +9425,7 @@ impl ViewerApp {
                         delete_member = true;
                     }
                 });
-                if matches!(self.odds_scope, OddsScope::Group(_)) {
+                if matches!(&scope, OddsScope::Group(_)) {
                     ui.label(
                         RichText::new(
                             "该分组下所有会员默认使用这份赔率；名单里个别会员可再加「会员覆盖」。",
@@ -8992,10 +9433,10 @@ impl ViewerApp {
                         .size(10.5)
                         .color(SUB),
                     );
-                } else if matches!(self.odds_scope, OddsScope::Member(_)) {
+                } else if matches!(&scope, OddsScope::Member(_)) {
                     ui.label(
                         RichText::new(
-                            "会员覆盖优先于分组；从注单选择的会员按「群聊 / 会话 + 发送人」区分，同名但来源不同的会员可以各设一份。",
+                            "会员覆盖优先于分组；未修改的字段自动跟随分组 / 默认，点「↺」可恢复继承。",
                         )
                         .size(10.5)
                         .color(SUB),
@@ -9006,75 +9447,226 @@ impl ViewerApp {
                 hairline(ui);
                 ui.add_space(4.0);
 
-                let region = self.odds_region.min(2);
-                let set = self.odds_scope_sets_mut();
-                let set = &mut set[region];
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .max_height(400.0)
-                    .id_salt("odds_fields_scroll")
-                    .show(ui, |ui| {
-                        for group in crate::odds::FIELD_GROUPS {
-                            let fields: Vec<&crate::odds::FieldDef> = crate::odds::FIELDS
-                                .iter()
-                                .filter(|f| f.group == *group)
-                                .collect();
-                            if fields.is_empty() {
-                                continue;
-                            }
-                            egui::Frame::new()
-                                .fill(CARD)
-                                .stroke(Stroke::new(1.0, BORDER))
-                                .corner_radius(CornerRadius::same(8))
-                                .inner_margin(Margin::symmetric(10, 6))
+                let body_h = (ui.available_height() - 44.0).max(180.0);
+                ui.horizontal_top(|ui| {
+                    // 左侧：玩法分组导航
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(112.0, body_h),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(112.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(body_h)
+                                .id_salt("odds_group_nav")
                                 .show(ui, |ui| {
+                            for (i, group) in
+                                crate::odds::FIELD_GROUPS.iter().enumerate()
+                            {
+                                let count = scope_masks
+                                    .as_ref()
+                                    .map(|m| {
+                                        crate::odds::FIELDS
+                                            .iter()
+                                            .filter(|f| {
+                                                f.group == *group
+                                                    && (0..3).any(|r| {
+                                                        m[r].is_owned(f.key)
+                                                    })
+                                            })
+                                            .count()
+                                    })
+                                    .unwrap_or(0);
+                                let label = if count > 0 {
+                                    format!("{group} ({count})")
+                                } else {
+                                    (*group).to_string()
+                                };
+                                if ui
+                                    .selectable_label(
+                                        self.odds_group_tab == i,
+                                        RichText::new(label).size(11.5),
+                                    )
+                                    .clicked()
+                                {
+                                    self.odds_group_tab = i;
+                                    self.odds_search.clear();
+                                }
+                            }
+                                });
+                        },
+                    );
+                    ui.separator();
+                    // 右侧：搜索 + 当前分组的字段
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            let mut resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.odds_search)
+                                    .hint_text("搜索玩法 / 字段，如：三中三")
+                                    .desired_width(220.0),
+                            );
+                            text_edit_context_menu(
+                                ui.ctx(),
+                                resp.id,
+                                &mut self.odds_search,
+                                &mut resp,
+                            );
+                            if !self.odds_search.is_empty()
+                                && ui.add(tiny_button("清除", SUB)).clicked()
+                            {
+                                self.odds_search.clear();
+                            }
+                        });
+                        let search = self.odds_search.trim().to_lowercase();
+                        let selected = crate::odds::FIELD_GROUPS[self
+                            .odds_group_tab
+                            .min(crate::odds::FIELD_GROUPS.len() - 1)];
+                        let fields: Vec<&crate::odds::FieldDef> = crate::odds::FIELDS
+                            .iter()
+                            .filter(|f| {
+                                if search.is_empty() {
+                                    f.group == selected
+                                } else {
+                                    f.label.to_lowercase().contains(&search)
+                                        || f.group.to_lowercase().contains(&search)
+                                }
+                            })
+                            .collect();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .max_height((body_h - 32.0).max(120.0))
+                            .id_salt("odds_fields_scroll")
+                            .show(ui, |ui| {
+                                if fields.is_empty() {
                                     ui.label(
-                                        RichText::new(*group)
-                                            .font(bold_font(12.5))
-                                            .color(TEXT),
+                                        RichText::new("没有匹配的字段")
+                                            .size(11.0)
+                                            .color(SUB),
                                     );
-                                    ui.add_space(2.0);
-                                    egui::Grid::new(format!("odds_grid_{group}"))
-                                        .num_columns(4)
-                                        .spacing([10.0, 4.0])
-                                        .show(ui, |ui| {
-                                            for (i, field) in fields.iter().enumerate() {
+                                }
+                                let region = self.odds_region.min(2);
+                                for field in fields {
+                                    let owned_any = scope_masks
+                                        .as_ref()
+                                        .map(|m| {
+                                            (0..3).any(|r| {
+                                                m[r].is_owned(field.key)
+                                            })
+                                        })
+                                        .unwrap_or(false);
+                                    if self.odds_only_modified
+                                        && scope_masks.is_some()
+                                        && !owned_any
+                                    {
+                                        continue;
+                                    }
+                                    let owned_here = scope_masks
+                                        .as_ref()
+                                        .map(|m| m[region].is_owned(field.key))
+                                        .unwrap_or(true);
+                                    let shown = if owned_here {
+                                        scope_sets[region].value(field.key)
+                                    } else {
+                                        inherited_sets[region].value(field.key)
+                                    };
+                                    let mut value = shown;
+                                    ui.horizontal(|ui| {
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(170.0, 20.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
                                                 ui.label(
                                                     RichText::new(field.label)
-                                                        .size(11.5)
+                                                        .size(11.0)
                                                         .color(SUB),
                                                 );
-                                                if let Some(v) =
-                                                    set.value_mut(field.key)
+                                            },
+                                        );
+                                        let suffix =
+                                            if field.kind == crate::odds::FieldKind::Rebate
+                                            {
+                                                "%"
+                                            } else {
+                                                ""
+                                            };
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut value)
+                                                    .speed(0.1)
+                                                    .max_decimals(2)
+                                                    .range(0.0..=10_000_000.0)
+                                                    .suffix(suffix),
+                                            )
+                                            .changed()
+                                        {
+                                            let regions: Vec<usize> =
+                                                if self.odds_sync_regions {
+                                                    vec![0, 1, 2]
+                                                } else {
+                                                    vec![region]
+                                                };
+                                            for r in regions {
+                                                if let Some(v) = scope_sets[r]
+                                                    .value_mut(field.key)
                                                 {
-                                                    ui.add(
-                                                        egui::DragValue::new(v)
-                                                            .speed(0.1)
-                                                            .max_decimals(2)
-                                                            .range(0.0..=10_000_000.0)
-                                                            .suffix(
-                                                                if field.kind
-                                                                    == crate::odds::FieldKind::Rebate
-                                                                {
-                                                                    "%"
-                                                                } else {
-                                                                    ""
-                                                                },
-                                                            ),
-                                                    );
+                                                    *v = value;
                                                 }
-                                                if i % 2 == 1 {
-                                                    ui.end_row();
+                                                if let Some(m) = &mut scope_masks {
+                                                    m[r].set_owned(field.key, true);
                                                 }
                                             }
-                                            if fields.len() % 2 == 1 {
-                                                ui.end_row();
+                                        }
+                                        let (badge, color) = match &scope {
+                                            OddsScope::Default => {
+                                                ("基础".to_string(), SUB)
                                             }
-                                        });
-                                });
-                            ui.add_space(5.0);
-                        }
+                                            OddsScope::Group(_) => {
+                                                if owned_here {
+                                                    ("已改".to_string(), ORANGE)
+                                                } else {
+                                                    ("默认".to_string(), SUB)
+                                                }
+                                            }
+                                            OddsScope::Member(_) => {
+                                                if owned_here {
+                                                    ("已改".to_string(), ORANGE)
+                                                } else if let Some(g) = &member_group {
+                                                    (
+                                                        format!(
+                                                            "继承 {}",
+                                                            truncate_display(g, 4)
+                                                        ),
+                                                        SUB,
+                                                    )
+                                                } else {
+                                                    ("继承默认".to_string(), SUB)
+                                                }
+                                            }
+                                        };
+                                        ui.label(
+                                            RichText::new(badge)
+                                                .size(9.5)
+                                                .color(color),
+                                        );
+                                        if owned_any
+                                            && scope_masks.is_some()
+                                            && ui
+                                                .add(tiny_button("↺", SUB))
+                                                .on_hover_text(
+                                                    "恢复继承（清除本项覆盖）",
+                                                )
+                                                .clicked()
+                                        {
+                                            if let Some(m) = &mut scope_masks {
+                                                for r in 0..3 {
+                                                    m[r].set_owned(field.key, false);
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            });
                     });
+                });
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -9101,30 +9693,208 @@ impl ViewerApp {
                 });
             });
 
+        // 本帧的字段编辑 / 恢复继承 / 澳门复制先落到局部变量，再写回草稿。
+        if reset_region {
+            if matches!(&scope, OddsScope::Default) {
+                for r in 0..3 {
+                    scope_sets[r] = crate::odds::OddsSet::default();
+                }
+            } else if let Some(m) = &mut scope_masks {
+                for r in 0..3 {
+                    m[r].clear();
+                }
+            }
+        }
+        if copy_macau {
+            let mut macau = inherited_sets[0].clone();
+            if let Some(m) = &scope_masks {
+                for f in crate::odds::FIELDS {
+                    if m[0].is_owned(f.key) {
+                        if let Some(v) = macau.value_mut(f.key) {
+                            *v = scope_sets[0].value(f.key);
+                        }
+                    }
+                }
+            } else {
+                macau = scope_sets[0].clone();
+            }
+            for r in 1..3 {
+                scope_sets[r] = macau.clone();
+                if let Some(m) = &mut scope_masks {
+                    for f in crate::odds::FIELDS {
+                        m[r].set_owned(f.key, true);
+                    }
+                }
+            }
+        }
+        match &scope {
+            OddsScope::Default => self.odds_draft.default = scope_sets,
+            OddsScope::Group(name) => {
+                self.odds_draft.groups.insert(name.clone(), scope_sets);
+                if let Some(m) = scope_masks {
+                    self.odds_draft.group_owned.insert(name.clone(), m);
+                }
+            }
+            OddsScope::Member(key) => {
+                self.odds_draft.members.insert(key.clone(), scope_sets);
+                if let Some(m) = scope_masks {
+                    self.odds_draft.member_owned.insert(key.clone(), m);
+                }
+            }
+        }
+
+        // 「复制到其他会员」：把当前编辑对象的三地区赔率 / 回水批量写入勾选的会员。
+        if self.odds_copy_open {
+            let mut dialog_open = true;
+            let mut do_copy = false;
+            let mut cancel_copy = false;
+            egui::Window::new("复制赔率配置")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(440.0)
+                .open(&mut dialog_open)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("来源：").size(12.0).color(TEXT));
+                        let current = self
+                            .odds_copy_template
+                            .clone()
+                            .unwrap_or_else(|| format!("当前对象（{scope_text}）"));
+                        let template_names: Vec<String> = self
+                            .odds_draft
+                            .templates
+                            .keys()
+                            .cloned()
+                            .collect();
+                        egui::ComboBox::from_id_salt("odds_copy_source")
+                            .width(300.0)
+                            .selected_text(RichText::new(current).size(11.5))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.odds_copy_template,
+                                    None,
+                                    format!("当前对象（{scope_text}）"),
+                                );
+                                for name in &template_names {
+                                    ui.selectable_value(
+                                        &mut self.odds_copy_template,
+                                        Some(name.clone()),
+                                        format!("模板：{name}"),
+                                    );
+                                }
+                            });
+                    });
+                    ui.label(
+                        RichText::new("选择要复用这份赔率 / 回水的会员（可多选）：")
+                            .size(11.0)
+                            .color(SUB),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(tiny_button("全选", TEXT)).clicked() {
+                            self.odds_copy_targets = copy_targets
+                                .iter()
+                                .map(|(key, _)| key.clone())
+                                .collect();
+                        }
+                        if ui.add(tiny_button("清空", TEXT)).clicked() {
+                            self.odds_copy_targets.clear();
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .id_salt("odds_copy_targets_scroll")
+                        .show(ui, |ui| {
+                            if copy_targets.is_empty() {
+                                ui.label(
+                                    RichText::new("暂无可复制的会员").size(11.0).color(SUB),
+                                );
+                            }
+                            for (key, label) in &copy_targets {
+                                let mut checked =
+                                    self.odds_copy_targets.contains(key);
+                                if ui.checkbox(&mut checked, label).changed() {
+                                    if checked {
+                                        self.odds_copy_targets.insert(key.clone());
+                                    } else {
+                                        self.odds_copy_targets.remove(key);
+                                    }
+                                }
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let n = self.odds_copy_targets.len();
+                        if ui
+                            .add_enabled(
+                                n > 0,
+                                tiny_button(&format!("复制给 {n} 人"), GREEN),
+                            )
+                            .clicked()
+                        {
+                            do_copy = true;
+                        }
+                        if ui.add(tiny_button("取消", SUB)).clicked() {
+                            cancel_copy = true;
+                        }
+                    });
+                });
+            if !dialog_open || cancel_copy {
+                self.odds_copy_open = false;
+            }
+            if do_copy {
+                let source = match &self.odds_copy_template {
+                    Some(name) => self
+                        .odds_draft
+                        .templates
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            self.odds_effective_for_scope(
+                                &self.odds_scope.clone(),
+                            )
+                        }),
+                    None => self
+                        .odds_effective_for_scope(&self.odds_scope.clone()),
+                };
+                let mut keys: Vec<String> =
+                    self.odds_copy_targets.iter().cloned().collect();
+                keys.sort();
+                // 来源本人不覆盖。
+                if let OddsScope::Member(src) = &self.odds_scope {
+                    keys.retain(|key| key != src);
+                }
+                for key in &keys {
+                    self.odds_draft.members.insert(key.clone(), source.clone());
+                    self.odds_draft
+                        .member_owned
+                        .insert(key.clone(), crate::odds::all_masks());
+                }
+                if let Some(first) = keys.first() {
+                    self.odds_scope = OddsScope::Member(first.clone());
+                }
+                self.odds_copy_open = false;
+                self.odds_copy_targets.clear();
+            }
+        }
+
         if let Some((key, group)) = add_member {
             self.odds_draft.ensure_member(&key, group.as_deref());
             self.odds_scope = OddsScope::Member(key);
             self.odds_new_member.clear();
         }
-        if reset_region {
-            let region = self.odds_region.min(2);
-            self.odds_scope_sets_mut()[region].reset_to_default();
-        }
-        if copy_macau {
-            let sets = self.odds_scope_sets_mut();
-            let macau = sets[0].clone();
-            sets[1] = macau.clone();
-            sets[2] = macau;
-        }
         if delete_member {
             if let OddsScope::Member(name) = self.odds_scope.clone() {
                 self.odds_draft.members.remove(&name);
+                self.odds_draft.member_owned.remove(&name);
             }
             self.odds_scope = OddsScope::Default;
         }
         if save {
             self.odds_draft
                 .groups
+                .retain(|name, _| group_names.iter().any(|g| g == name));
+            self.odds_draft
+                .group_owned
                 .retain(|name, _| group_names.iter().any(|g| g == name));
             self.odds = self.odds_draft.clone();
             crate::odds::save(&self.odds);
@@ -12613,7 +13383,7 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
 }
 
 /// 成员索引条目：色点 + 名称；选中时铺绿底并在左侧压一条书签线。
-fn rail_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+fn rail_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
     let fill = if selected {
@@ -12664,7 +13434,7 @@ fn rail_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.clicked()
+    resp
 }
 
 fn contains_lo(hay: &str, q: &str) -> bool {

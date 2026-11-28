@@ -142,11 +142,7 @@ fn draw_of(draws: &Draws, region: usize) -> &RegionDraw {
     draws.get(REGION_NAMES[region])
 }
 
-fn odds_of<'a>(
-    odds: &'a OddsConfig,
-    group: Option<&str>,
-    region: usize,
-) -> &'a OddsSet {
+fn odds_of(odds: &OddsConfig, group: Option<&str>, region: usize) -> OddsSet {
     odds.resolve("", group, region)
 }
 
@@ -253,7 +249,7 @@ fn build_column(
         .filter(|b| b.region == region && list_matches(list, &b.bet.play))
     {
         col.total_stake += b.bet.amount.max(0.0) * b.sign();
-        col.total_water += water_of(&b.bet, set) * b.sign();
+        col.total_water += water_of(&b.bet, &set) * b.sign();
     }
 
     match list {
@@ -570,7 +566,7 @@ pub fn xiaoma(
         let size = if play_idx == 0 || play_idx == 3 { 3 } else { 2 };
         let label = PLAY_LABELS[play_idx].to_string();
         let per = per_bet_row(b);
-        let rebate_rate = rebate_rate(&bet.play, set);
+        let rebate_rate = rebate_rate(&bet.play, &set);
         for combo in bet_combos(bet, size, mul_sep) {
             let hits = combo.iter().filter(|n| draw6.contains(n)).count();
             let (hit, win) = match bet.play.as_str() {
@@ -648,7 +644,7 @@ pub fn xiaoma(
         .map(|((region, label, composite), a)| {
             // 风险按名义倍率算；倍率与玩法一一对应（二全中走自己那一档）。
             let set = odds_of(odds, odds_group, region);
-            let nominal = nominal_multiplier(&a.play, set);
+            let nominal = nominal_multiplier(&a.play, &set);
             let key = composite
                 .split_once('\t')
                 .map(|(_, k)| k.to_string())
@@ -976,6 +972,9 @@ mod tests {
         let group = odds.groups.get_mut("A组").unwrap();
         *group[0].value_mut("three_in_three").unwrap() = 100.0;
         *group[0].value_mut("rw_three_in_three").unwrap() = 10.0;
+        let masks = odds.group_owned.get_mut("A组").unwrap();
+        masks[0].set_owned("three_in_three", true);
+        masks[0].set_owned("rw_three_in_three", true);
 
         let rows = xiaoma(&bets, &draws(), &odds, Some("A组"), "拖");
         assert_eq!(rows.len(), 1);
